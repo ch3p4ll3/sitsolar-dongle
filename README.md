@@ -9,11 +9,17 @@ through the vendor cloud.
 
 Nothing in this package ever writes to the inverter — only FC 0x04 / 0x03 reads.
 
+> **Unofficial project.** It is not affiliated with, endorsed by or supported by
+> SiNeng, FuturaPulse or Sit Solar. The protocol was worked out from the vendor's
+> Android app and its published Modbus protocol document. Use it at your own
+> risk, on your own equipment.
+
 ## Install
 
+From the root of this repository:
+
 ```bash
-cd dongle-reader
-uv venv && uv pip install -e .          # or: pip install -e .
+uv venv && uv sync
 ```
 
 Requires Python 3.10+ and `pycryptodome`.
@@ -21,11 +27,11 @@ Requires Python 3.10+ and `pycryptodome`.
 ## Quick start
 
 ```bash
-sitsolar-dongle 192.168.1.50 --sn 300018101261010226
+sitsolar-dongle 192.168.1.50 --sn <DONGLE_SERIAL>
 ```
 
-`--sn` is the **dongle** serial number (the 19-digit number printed on the
-dongle itself, not the inverter's). Both session keys are derived from it:
+`--sn` is the **dongle** serial number (the number printed on the dongle
+itself, not the inverter's). Both session keys are derived from it:
 
 ```
 aes_key  = MD5(sn || crc16_be(sn))
@@ -34,6 +40,10 @@ hmac_key = MD5(reverse(sn) || crc16_be(reverse(sn)))
 
 If the serial is wrong every frame fails authentication, so the tool fails
 fast with `HMAC mismatch (wrong serial number?)`.
+
+> **Treat the serial like a password.** Both keys come from it alone, so anyone
+> on your network who knows it can talk to the dongle. Don't commit it, paste it
+> into issues, or share logs and captures that contain it.
 
 ### Useful invocations
 
@@ -62,7 +72,7 @@ sitsolar-dongle --list
 ```python
 from sitsolar_dongle import DongleClient
 
-with DongleClient("192.168.1.50", "300018101261010226") as dongle:
+with DongleClient("192.168.1.50", "<DONGLE_SERIAL>") as dongle:
     print(dongle.info)                       # factory, model, serial, clock
 
     hz = dongle.read(31002, 2)               # two 16-bit words, big endian
@@ -87,10 +97,12 @@ fatal.
 +--------+----------+--------+------+---------------------------------+
 ```
 
-* The 7-byte header survives encryption untouched; `length` counts everything
-  after it (`len(envelope) + 1`).
-* Outgoing frames use protocol id `0x1000`; unsolicited pushes from the dongle
-  arrive as `0x0001`.
+* The 7-byte header (`tid`, `protocol`, `length`, `unit`) is sent in the clear:
+  it is neither encrypted nor covered by the HMAC. `length` counts the unit
+  byte plus the envelope (`1 + len(envelope)`).
+* Outgoing frames use protocol id `0x1000`, except the reply to a heartbeat
+  push, which uses `0x1001`. Unsolicited pushes from the dongle arrive as
+  `0x0001`.
 * The HMAC covers `IV || ciphertext` and is checked before decryption, so a
   wrong key fails cleanly rather than producing garbage.
 
@@ -102,9 +114,9 @@ response: 64 07 00          | slave fc [bytecount data | exception] crc16(2)
 ```
 
 The CRC16 is a vendor-specific routine (not the standard Modbus CRC) and is
-sent high byte first. `64 07 02` is a constant — **the target device is chosen
-by the slave address byte** inside the inner frame: `0x00` is the dongle
-itself, `0x01` is the inverter behind it.
+sent high byte first. The `64 07 00 02 00 05` prefix is a constant — **the
+target device is chosen by the slave address byte** inside the inner frame:
+`0x00` is the dongle itself, `0x01` is the inverter behind it.
 
 The handshake, mirroring the app:
 
@@ -160,6 +172,17 @@ project never writes.
 * Function codes in the app's JSON templates are parsed as *decimal*, so a
   template value of `"66"` is `0x42` on the wire.
 
+## Tested with
+
+| | |
+|---|---|
+| Dongle | SiNeng / FuturaPulse "Si-Dongle-L" |
+| Inverter | Futura Sun 3K-HS (single-phase high-voltage hybrid, device type 33) |
+| Firmware | DSP1 `0000090021`, DSP2 `0000060010`, ARM `001002032` |
+
+Other models and firmware versions may expose different register blocks. Reports
+are welcome, please redact your serial number first.
+
 ## Tests
 
 ```bash
@@ -169,6 +192,11 @@ pytest tests/
 ```
 
 The suite pins the CRC16 lookup tables against vectors taken from the APK and
-a live dongle — the tables are **not** symmetric, and a single wrong row
-corrupts only the AES key while the HMAC key keeps validating, which shows up
+a live dongle, the tables are **not** symmetric, and a single wrong row can
+corrupt only one of the two keys (which one depends on the digits of the
+serial). If it hits the AES key, the HMAC key keeps validating, which shows up
 as the baffling "every frame authenticates but nothing decrypts" symptom.
+
+## License
+
+GNU General Public License v3.0, see [LICENSE](LICENSE).
