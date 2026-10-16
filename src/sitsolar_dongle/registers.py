@@ -115,6 +115,93 @@ BATTERY_STATUS = {
 
 BMS_STATUS = {0: "fail", 1: "ok", 2: "battery not chosen"}
 
+# Appendix 1, Charts 8-10: registers 30207-30210 are four bit-field warning
+# words.  Chart 11 (register 30211) is NOT a bit field -- it carries a single
+# decimal warning code that addresses the *combined* space of those four words
+# as `201 + 16*word_index + bit_index`.  That formula reproduces every row of
+# Chart 11 exactly (201/202/204/205.../213 from word 0, 219/223/224/225/229/230
+# from word 1, 241/245/247 from word 2), which is what proves 30211 is a code
+# rather than a bit mask -- and proves that the value 200 sits one below the
+# first possible code, i.e. "no warning".
+#
+# Chart 8 -> 30207
+WARNING_BITS_1 = {
+    0: "AC over current",
+    1: "AC wave-filter and current-limiting calculation",
+    2: "HVRT",
+    3: "LVRT",
+    4: "PV~ground voltage high",
+    5: "Islanding",
+    6: "DSP EEPROM error",
+    7: "Clock error",
+    8: "MCU_Register error",
+    9: "MCU_RAM error",
+    10: "MCU_ROM error",
+    11: "DSP FLASH error",
+    12: "ARM FLASH error",
+    13: "Low temperature",
+}
+
+# Chart 9 -> 30208
+WARNING_BITS_2 = {
+    2: "MPPT over current",
+    3: "MPPT wave-filter and current-limiting calculation",
+    4: "MPPT startup voltage high",
+    5: "PV abnormal (mismatch, shading)",
+    6: "Boost1 wave-filter and current-limiting calculation",
+    7: "Boost2 wave-filter and current-limiting calculation",
+    8: "Boost3 wave-filter and current-limiting calculation",
+    12: "AC wave-filter and current-limiting warning",
+    13: "Conversion PWM error",
+    14: "EPS overloading",
+}
+
+# Chart 10 -> 30209
+WARNING_BITS_3 = {
+    2: "MPPT2 over current",
+    3: "MPPT3 over current",
+    5: "PV voltage low",
+    6: "BUS voltage low",
+    8: "BuckBoost hardware overcurrent",
+    9: "BuckBoost wave-filter and current-limiting",
+    10: "MPPT2 wave-filter and current-limiting",
+    11: "MPPT3 wave-filter and current-limiting",
+    12: "Buck Boost software overcurrent",
+    13: "Balance bridge software overcurrent",
+    14: "Balance bridge hardware overcurrent",
+}
+
+# Chart 11 -> 30211, decoded warning codes.  Entries marked (*) are absent from
+# Chart 11 in the PDF but are forced by the formula above (203 = HVRT and
+# 214 = Low temperature are both present in Chart 8).
+WARNING_CODES = {
+    200: "no warning",
+    201: "AC over current",
+    202: "AC wave-filter and current-limiting calculation",
+    203: "HVRT (*)",
+    204: "LVRT",
+    205: "PV~ground voltage high",
+    206: "Islanding",
+    207: "DSP EEPROM error",
+    208: "Clock error",
+    209: "MCU_Register error",
+    210: "MCU_RAM error",
+    211: "MCU_ROM error",
+    212: "DSP FLASH error",
+    213: "ARM FLASH error",
+    214: "Low temperature (*)",
+    219: "MPPT over current",
+    220: "MPPT hardware over current",
+    223: "Boost 1 wave-filter and current-limiting calculation",
+    224: "Boost 2 wave-filter and current-limiting calculation",
+    225: "Boost 3 wave-filter and current-limiting calculation",
+    229: "AC wave-filter and current-limiting calculation",
+    230: "PWM error",
+    241: "BuckBoost hardware over current",
+    245: "BuckBoost overcurrent",
+    247: "Balance bridge hardware over current",
+}
+
 
 REGISTERS: tuple[Register, ...] = (
     # ---- device_info ----------------------------------------------
@@ -154,11 +241,18 @@ REGISTERS: tuple[Register, ...] = (
     _r(30204, "dsp_error5", "DSP error 5"),
     _r(30205, "dsp_error6", "DSP error 6"),
     _r(30206, "dsp_error7", "DSP error 7"),
-    _r(30207, "dsp_warning1", "DSP warning 1"),
-    _r(30208, "dsp_warning2", "DSP warning 2"),
-    _r(30209, "dsp_warning3", "DSP warning 3"),
-    _r(30210, "dsp_warning4", "DSP warning 4"),
-    _r(30211, "dsp_warning5", "DSP warning 5"),
+    _r(30207, "dsp_warning1", "DSP warning 1", dtype=BITFIELD,
+       bits=WARNING_BITS_1),
+    _r(30208, "dsp_warning2", "DSP warning 2", dtype=BITFIELD,
+       bits=WARNING_BITS_2),
+    _r(30209, "dsp_warning3", "DSP warning 3", dtype=BITFIELD,
+       bits=WARNING_BITS_3),
+    _r(30210, "dsp_warning4", "DSP warning 4", dtype=BITFIELD,
+       notes="the protocol document gives no chart for 30210, so its bits "
+             "are unknown; codes 249+ would belong to this word"),
+    _r(30211, "dsp_warning5", "DSP warning 5", enum=WARNING_CODES,
+       notes="Chart 11: carries a decimal warning code, not a bit mask. "
+             "200 means no warning"),
 
     # ---- temperatures -------------------------------------------
     _r(30301, "cabin_temperature", "Cabin temperature", dtype=S16,
@@ -209,14 +303,24 @@ REGISTERS: tuple[Register, ...] = (
              "the R and S phases are S32 at the same offset, so treat as S32"),
     _r(31018, "inverter_p", "P_Inv", dtype=S32, unit="W"),
     _r(31020, "inverter_q", "Q_Inv", dtype=S32, unit="var"),
-    _r(31022, "power_factor", "Power factor", dtype=S16, scale=0.001),
+    _r(31022, "power_factor", "Power factor", dtype=S16, scale=0.001,
+       notes="reads a near-constant 0.999 and equals P/(31039~31040) to within "
+             "0.005, but contradicts P/sqrt(P^2+Q^2) ~= 0.89 measured on the "
+             "same poll. The vendor's own cloud publishes the same 0.999, so "
+             "this is a firmware/setpoint value, not the instantaneous PF "
+             "(the spec has a separate writable 46056 Power factors adjust)"),
     _r(31035, "grid_line_rs", "RS grid line voltage", unit="V", scale=0.1),
     _r(31036, "grid_line_st", "ST grid line voltage", unit="V", scale=0.1),
     _r(31037, "grid_line_tr", "TR grid line voltage", unit="V", scale=0.1),
     _r(31038, "grid_n_pe_voltage", "Grid N-PE voltage", dtype=S16,
        unit="V", scale=0.1),
     _r(31039, "apparent_power", "Inverter output apparent power",
-       unit="VA", dtype=U32),
+       unit="VA", dtype=U32,
+       notes="the spec calls this apparent power, but it tracks P (31018~31019) "
+             "within 1-2 W: 419 VA vs 417 W, 425 VA vs 424 W, i.e. it is "
+             "P/power_factor. True apparent power is V*I and sqrt(P^2+Q^2), "
+             "which agree with each other at ~470 VA -- about 50 VA higher. Do "
+             "not use as S for a VA sensor; compute sqrt(P^2+Q^2) instead"),
 
     # ---- EPS_parameters -----------------------------------------
     _r(32001, "eps_voltage_r", "EPS voltage R", unit="V", scale=0.1),
@@ -282,7 +386,11 @@ REGISTERS: tuple[Register, ...] = (
     # ---- meter_parameters ---------------------------------------
     _r(33001, "meter_r_voltage", "Meter R-phase voltage", unit="V", scale=0.1),
     _r(33002, "meter_r_current", "Meter R-phase current", dtype=S16,
-       unit="A", scale=0.1),
+       unit="A", scale=0.1,
+       notes="the spec's 0.1 scale is doubtful: 14 -> 1.4 A implies "
+             "V*I ~= 327 VA while total P reads 0-1 W and Q reads 25 var "
+             "(S ~= 25 VA). A 0.01 scale would give 0.14 A -> 33 VA, which "
+             "fits. Voltage and power both agree with the vendor cloud"),
     _r(33003, "meter_r_frequency", "Meter R-phase frequency", unit="Hz", scale=0.01),
     _r(33004, "meter_r_power", "Meter R-phase power", dtype=S32, unit="W"),
     _r(33006, "meter_s_voltage", "Meter S-phase voltage", unit="V", scale=0.1),
@@ -298,26 +406,38 @@ REGISTERS: tuple[Register, ...] = (
     _r(33016, "meter_total_p", "Meter total P", dtype=S32, unit="W",
        notes="positive = generation, negative = consumption"),
     _r(33018, "meter_total_q", "Meter total Q", dtype=S32, unit="var"),
-    _r(33020, "meter_power_factor", "Meter power factor", dtype=S16, scale=0.01),
+    _r(33020, "meter_power_factor", "Meter power factor", dtype=S16, scale=0.01,
+       notes="self-consistent, unlike the inverter's 31022: with P at 0-1 W and "
+             "Q at 25 var, P/sqrt(P^2+Q^2) is ~0.00-0.04 and the register reads "
+             "0.00. Any small value here just means grid exchange is near zero, "
+             "so this number carries no information in self-consumption mode"),
     _r(33040, "energy_to_grid_total", "E-Total to grid", unit="kWh", scale=0.1,
-       notes="sell to grid"),
+       dtype=U32, notes="sell to grid"),
     _r(33042, "energy_from_grid_total", "E-Total from grid", unit="kWh", scale=0.1,
-       notes="buy from grid"),
+       dtype=U32, notes="buy from grid"),
 
     # ---- generation_info ------------------------------------------
+    # Every *_total below is U32 and was first written without dtype=U32, which
+    # made it read a single register -- the high word, which is always 0 -- and
+    # report 0 for the whole lifetime counter.  The low word (address + 1) is
+    # where the magnitude actually lives.
     _r(34001, "energy_from_inverter_total", "E-Total from inverter",
-       unit="kWh", scale=0.1),
+       unit="kWh", scale=0.1, dtype=U32),
     _r(34003, "energy_to_inverter_total", "E-Total to inverter",
-       unit="kWh", scale=0.1),
-    _r(34005, "energy_from_pv_total", "E-Total from PV", unit="kWh", scale=0.1),
-    _r(34007, "energy_to_battery_total", "E-Total to battery", unit="kWh", scale=0.1),
+       unit="kWh", scale=0.1, dtype=U32),
+    _r(34005, "energy_from_pv_total", "E-Total from PV", unit="kWh", scale=0.1,
+       dtype=U32),
+    _r(34007, "energy_to_battery_total", "E-Total to battery", unit="kWh",
+       scale=0.1, dtype=U32),
     _r(34009, "energy_from_battery_total", "E-Total from battery",
-       unit="kWh", scale=0.1),
+       unit="kWh", scale=0.1, dtype=U32),
     _r(34011, "energy_grid_to_battery_total", "E-Total from grid to battery",
-       unit="kWh", scale=0.1),
-    _r(34013, "energy_to_eps_total", "E-Total to EPS", unit="kWh", scale=0.1),
-    _r(34015, "hours_generation_total", "H-Total of generation", unit="h"),
-    _r(34019, "hours_eps_total", "H-Total of EPS", unit="h"),
+       unit="kWh", scale=0.1, dtype=U32),
+    _r(34013, "energy_to_eps_total", "E-Total to EPS", unit="kWh", scale=0.1,
+       dtype=U32),
+    _r(34015, "hours_generation_total", "H-Total of generation", unit="h",
+       dtype=U32),
+    _r(34019, "hours_eps_total", "H-Total of EPS", unit="h", dtype=U32),
     _r(34021, "energy_today_dc", "E-today (DC generation)", unit="kWh", scale=0.1),
     _r(34022, "energy_today_battery_charge", "E-today (battery charge)",
        unit="kWh", scale=0.1),
@@ -342,15 +462,15 @@ REGISTERS: tuple[Register, ...] = (
     _r(34033, "energy_today_battery_eps", "E-today (battery power EPS)",
        unit="kWh", scale=0.1),
     _r(34034, "energy_total_pv_charge_battery", "E-total (PV charge battery)",
-       unit="kWh", scale=0.1),
+       unit="kWh", scale=0.1, dtype=U32),
     _r(34036, "energy_total_eps_from_pv", "E-total (EPS consume PV)",
-       unit="kWh", scale=0.1),
+       unit="kWh", scale=0.1, dtype=U32),
     _r(34038, "energy_total_pv_sell_to_grid", "E-total (PV sell to grid)",
-       unit="kWh", scale=0.1),
+       unit="kWh", scale=0.1, dtype=U32),
     _r(34040, "energy_total_battery_to_grid", "E-total (battery discharge to grid)",
-       unit="kWh", scale=0.1),
+       unit="kWh", scale=0.1, dtype=U32),
     _r(34042, "energy_total_battery_to_eps", "E-total (battery discharge to EPS)",
-       unit="kWh", scale=0.1),
+       unit="kWh", scale=0.1, dtype=U32),
 
     # ---- Italy_self-test ----------------------------------------
     _r(35001, "ips_result", "IPS result",

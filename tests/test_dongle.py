@@ -13,6 +13,7 @@ from Crypto.Cipher import AES
 
 from sitsolar_dongle import (
     HEADER,
+    DongleNoDataError,
     EnvelopeError,
     ModbusError,
     build_read,
@@ -188,6 +189,11 @@ def test_register_map_is_consistent() -> None:
             assert reg.length == 2, reg.key
         assert 0 <= reg.address <= 0xFFFF
 
+    # Widening an entry to U32 must never swallow its neighbour.
+    spans = sorted((r.address, r.end, r.key) for r in REGISTERS)
+    for (a1, e1, k1), (a2, e2, _) in zip(spans, spans[1:]):
+        assert e1 < a2, "%s (%d-%d) overlaps %d" % (k1, a1, e1, a2)
+
 
 def test_blocks_cover_the_map_and_fit_in_one_frame() -> None:
     wanted = set()
@@ -244,6 +250,90 @@ def test_decode_enum_and_bits() -> None:
         "master DSP updating slave DSP", "DC power off",
     ]
     assert decode(flags, (0,))["active_bits"] == []
+
+
+def test_lifetime_totals_span_two_registers() -> None:
+    """Regression: 16 lifetime counters were declared as plain U16.
+
+    Each read only its own address -- the high word, which is always 0 -- so
+    every lifetime total reported zero while the data sat in the low word one
+    register over. Live values below come from 300018101261010226 and match
+    the vendor cloud's figures exactly.
+    """
+    u32_addresses = [
+        33040, 33042,                       # meter energy totals
+        34001, 34003, 34005, 34007, 34009,  # generation info
+        34011, 34013, 34015, 34019,
+        34034, 34036, 34038, 34040, 34042,
+    ]
+    by_addr = {r.address: r for r in REGISTERS}
+    for addr in u32_addresses:
+        reg = by_addr[addr]
+        assert reg.dtype == U32, "%d %s is %s" % (addr, reg.key, reg.dtype)
+        assert reg.length == 2, "%d %s" % (addr, reg.key)
+
+    # Big-endian: address+1 holds the low word, so (0, 6002) is 600.2 and a
+    # byte-swapped reading would be 393,375,744.
+    assert decode(by_addr[34007], (0, 6002))["value"] == 600.2   # all_charge
+    assert decode(by_addr[34038], (0, 745))["value"] == 74.5     # pv -> grid
+    assert decode(by_addr[33040], (0, 4465))["value"] == 446.5   # totalOngridPower
+    assert decode(by_addr[34015], (0, 2292))["value"] == 2292    # generation hours
+
+
+def test_parse_read_reply_dongle_no_data_stub() -> None:
+    """Outside its own table the dongle answers a bare ``64 07 01``.
+
+    No Modbus frame follows it at all, so this must not be confused with a
+    truncated reply or with a Modbus exception from the inverter.
+    """
+    try:
+        parse_read_reply(bytes.fromhex("640701"))
+    except DongleNoDataError as exc:
+        assert exc.status == 1
+        assert "no data" in str(exc)
+    else:
+        raise AssertionError("640701 stub was not recognised")
+
+    # Status 0 followed by a real frame is still the success path.
+    body = bytes([0x01, 0x04, 0x02, 0xC3, 0x54])
+    ok = bytes([0x64, 0x07, 0x00]) + body + crc16_bytes(body)
+    assert parse_read_reply(ok).registers == (0xC354,)
+
+    # Unrelated garbage still raises ValueError, not DongleNoDataError.
+    try:
+        parse_read_reply(b"\x01\x02\x03\x04\x05\x06")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("garbage was accepted")
+
+
+def test_warning_registers() -> None:
+    """30211 carries a decimal code, not a bit mask -- see Chart 11."""
+    code = next(r for r in REGISTERS if r.key == "dsp_warning5")
+    assert decode(code, (200,))["label"] == "no warning"
+    assert decode(code, (241,))["label"] == "BuckBoost hardware over current"
+    assert decode(code, (999,))["label"] == "unknown (999)"
+
+    # 30207~30210 are the ordinary bit fields (Charts 8-10).
+    bits = next(r for r in REGISTERS if r.key == "dsp_warning1")
+    out = decode(bits, (1 << 3,))                  # BIT03 = LVRT
+    assert out["value"] == 8
+    assert out["active_bits"] == ["LVRT"]
+    assert decode(bits, (0,))["active_bits"] == []
+
+
+def test_power_registers_do_not_claim_to_agree() -> None:
+    """31039~31040 tracks P (within 1-2 W), so it is not the apparent power
+    the spec calls it, and 31022 is a near-constant setpoint. Both caveats
+    have to stay in the map rather than be silently trusted."""
+    s = next(r for r in REGISTERS if r.key == "apparent_power")
+    inv_p = next(r for r in REGISTERS if r.key == "inverter_p")
+    assert s.dtype == U32 and s.length == 2
+    assert s.address != inv_p.address          # they are separate registers
+    assert "sqrt" in s.notes                   # the usable definition of S
+    pf = next(r for r in REGISTERS if r.key == "power_factor")
+    assert "setpoint" in pf.notes              # why 0.999 must not be trusted
 
 
 if __name__ == "__main__":  # pragma: no cover

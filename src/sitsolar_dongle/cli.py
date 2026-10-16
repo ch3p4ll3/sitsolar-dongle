@@ -28,7 +28,8 @@ from typing import Any, Sequence
 
 from . import __version__
 from .client import DEFAULT_PORT, DongleClient, DongleError
-from .framing import FC_READ_HOLDING, FC_READ_INPUT, ModbusError
+from .framing import FC_READ_HOLDING, FC_READ_INPUT, DongleNoDataError, \
+    ModbusError
 from .registers import REGISTERS, SECTION_ORDER, blocks
 
 
@@ -102,6 +103,8 @@ def _print_map() -> int:
         if reg.unit:
             extra += " [%s]" % reg.unit
         print("  %-7s %-42s %-7s%s" % (reg.span, reg.name, reg.dtype, extra))
+        if reg.notes:
+            print("  %-7s ^-- note: %s" % ("", reg.notes))
     print("\n%d values in %d read ranges" % (len(REGISTERS), len(blocks())))
     return 0
 
@@ -138,7 +141,13 @@ def _raw_reads(dongle: DongleClient, specs: Sequence[str],
             raise SystemExit("--read expects ADDR:COUNT, got %r" % spec)
         if not 1 <= count <= 50:
             raise SystemExit("--read COUNT must be 1..50, got %d" % count)
-        words = dongle.read(addr, count, fc=fc)
+        try:
+            words = dongle.read(addr, count, fc=fc)
+        except (ModbusError, DongleNoDataError) as exc:
+            # Keep going: a probe over several ranges is useless if one
+            # refused range discards every reading made before it.
+            out.append({"address": addr, "count": count, "error": str(exc)})
+            continue
         out.append({
             "address": addr,
             "count": count,
@@ -156,6 +165,13 @@ def _pretty(data: dict[str, Any], *, raw: bool) -> None:
 
     width = max((len(k) for k, v in data.items()
                  if not k.startswith("_") and isinstance(v, dict)), default=10)
+    reads = data.get("reads")
+    if reads is not None:
+        # raw --read mode: a list of {address, count, hex|error}, not a map
+        for item in reads:
+            outcome = item.get("error") or item.get("hex", "")
+            print("  %d:%d  %s" % (item["address"], item["count"], outcome))
+        return
     section = None
     for key, value in data.items():
         if key.startswith("_") or not isinstance(value, dict):
@@ -248,7 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     break
                 sys.stdout.flush()
                 time.sleep(args.interval)
-    except ModbusError as exc:
+    except (ModbusError, DongleNoDataError) as exc:
         print("modbus error: %s" % exc, file=sys.stderr)
         return 3
     except (DongleError, OSError) as exc:

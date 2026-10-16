@@ -31,6 +31,7 @@ from .crc import crc16_bytes
 __all__ = [
     "HEADER",
     "MAX_REGISTERS",
+    "DongleNoDataError",
     "Frame",
     "ModbusError",
     "ReadReply",
@@ -62,6 +63,26 @@ class ModbusError(Exception):
         self.fc = fc
         super().__init__("slave %d: %s (exception 0x%02X, FC 0x%02X)"
                          % (slave, ERROR_NAMES.get(code, "unknown error"), code, fc))
+
+
+class DongleNoDataError(Exception):
+    """The dongle answered a bare ``64 07 <status>`` stub instead of a frame.
+
+    The success prefix is ``64 07 00`` followed by the Modbus reply; when the
+    dongle has nothing to return for a range it sends just those three bytes
+    with a non-zero status and no Modbus frame behind it at all. Observed for
+    33051-33100, 33950-33999 and 34051-34100.
+
+    This is a *dongle*-level refusal and is distinct from
+    :class:`ModbusError`, which is the *inverter* rejecting the request -- e.g.
+    34101+ answers a proper Modbus exception 0x02 (illegal data address) rather
+    than a stub.
+    """
+
+    def __init__(self, status: int) -> None:
+        self.status = status
+        super().__init__("dongle returned no data (stub 6407%02X: address "
+                         "outside its table)" % status)
 
 
 ERROR_NAMES = {
@@ -147,8 +168,14 @@ def parse_read_reply(payload: bytes) -> ReadReply:
     """Decode the decrypted payload of a read reply.
 
     Accepts both the success form (``fc bytecount data``) and the exception
-    form (``fc|0x80 code``); the latter raises :class:`ModbusError`.
+    form (``fc|0x80 code``); the latter raises :class:`ModbusError`. The bare
+    ``64 07 <status>`` stub raises :class:`DongleNoDataError`.
     """
+    if (len(payload) >= 3 and payload[:2] == HEADER[:2]
+            and payload[2] != HEADER[2]):
+        # `64 07 <status>` with nothing behind it: the dongle refused the range.
+        raise DongleNoDataError(payload[2])
+
     if len(payload) < 6 or payload[:3] != HEADER[:3]:
         raise ValueError("not a read reply: %r" % payload[:6].hex())
 

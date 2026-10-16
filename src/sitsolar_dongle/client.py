@@ -28,8 +28,8 @@ from typing import Any, Iterator
 from . import framing
 from .crypto import Keys, derive_keys, open_envelope, seal
 from .decode import decode
-from .framing import Frame, ModbusError, build_read, parse_header, \
-    parse_read_reply, wrap_payload
+from .framing import DongleNoDataError, Frame, ModbusError, build_read, \
+    parse_header, parse_read_reply, wrap_payload
 from .registers import REGISTERS, blocks
 
 __all__ = ["DongleClient", "DongleInfo", "Device", "DongleError"]
@@ -330,9 +330,13 @@ class DongleClient:
              on_error: str = "skip") -> dict[str, Any]:
         """Read every documented read-only register and decode it.
 
-        Ranges that raise a Modbus exception are skipped (``on_error="skip"``)
-        because firmwares differ in which optional blocks they implement --
-        for instance a single-phase unit has no S or T phase.
+        Ranges the device refuses are skipped (``on_error="skip"``) because
+        firmwares differ in which optional blocks they implement -- for
+        instance a single-phase unit has no S or T phase, and unimplemented
+        ranges come back either as a Modbus exception
+        (:class:`ModbusError`) or as the dongle's bare ``64 07 01`` stub
+        (:class:`DongleNoDataError`).  Both are recorded under
+        ``_unreadable_ranges``.
         """
         target = self.slave if slave is None else slave
         words: dict[int, int] = {}
@@ -342,7 +346,7 @@ class DongleClient:
             count = end - start + 1
             try:
                 values = self.read(start, count, slave=target, fc=fc)
-            except ModbusError as exc:
+            except (ModbusError, DongleNoDataError) as exc:
                 if on_error == "raise":
                     raise
                 failures.append({"range": "%d~%d" % (start, end),

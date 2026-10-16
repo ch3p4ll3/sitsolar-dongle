@@ -118,6 +118,13 @@ sent high byte first. The `64 07 00 02 00 05` prefix is a constant — **the
 target device is chosen by the slave address byte** inside the inner frame:
 `0x00` is the dongle itself, `0x01` is the inverter behind it.
 
+A reply consisting of just `64 07 01` — the three prefix bytes with a
+non-zero third byte and no frame behind them at all — means the dongle has no
+data for that address. It raises `DongleNoDataError` and is a *dongle*-level
+refusal, distinct from a Modbus exception raised by the *inverter*: addresses
+past `34100` answer a proper `0x02` illegal data address, while `33051–33100`,
+`33950–33999` and `34051–34100` come back as the bare stub.
+
 The handshake, mirroring the app:
 
 1. `BeforeAccredit` (`42 02`) → dongle replies with version, factory, model,
@@ -155,6 +162,16 @@ Document register numbers are used **verbatim** as the Modbus PDU address — no
 `30000` offset is subtracted. That is confirmed both by the document's own
 example frames (`01 04 75 94 …` reads register 30100) and by live traffic.
 
+32-bit values are **big-endian pairs**: the low address holds the *high* word,
+so `(0, 50010)` at `31002~31003` is 50.010 Hz. This is worth stating explicitly
+because the lifetime counters were first mapped as single 16-bit registers —
+which read only the high word, always `0` — and so reported every lifetime
+total as zero while the real value sat one register over. As a cross-check the
+decoded totals now match the vendor cloud exactly: `all_charge` 600.2,
+`all_discharge` 570.1, `all_pv_to_battery_level` 437.6,
+`all_battery_to_grid_capacity` 317.7, `totalOngridPower` 446.5,
+`totalBuyGridPower` 51.8 kWh.
+
 The writable holding registers (`40001`–`49999`) are deliberately absent: this
 project never writes.
 
@@ -164,13 +181,36 @@ project never writes.
   connections for roughly 75 s after a rapid reconnect. Keep each session on a
   single socket and space out runs.
 * **Firmwares differ.** Single-phase units have no S/T phase, and optional
-  blocks (EPS, meter, Italy self-test) may raise Modbus exception `0x02`. Those
-  ranges are skipped by default.
+  blocks (EPS, meter, Italy self-test) may refuse a read — either with Modbus
+  exception `0x02` from the inverter or with the dongle's bare `64 07 01`
+  stub. Both are recorded under `_unreadable_ranges` by default.
 * **`31016~31017` T-phase power** is documented as `S16` in the table but the
   address spans two registers and the R/S phases are `S32`; it is treated as
   `S32` here.
 * Function codes in the app's JSON templates are parsed as *decimal*, so a
   template value of `"66"` is `0x42` on the wire.
+
+### Where the document disagrees with the hardware
+
+Every entry below was checked against a live 3K-HS and against the vendor's own
+cloud API, which is what the official app displays. Each one is also recorded in
+the `notes` field of the register and printed by `--list`.
+
+| Register | Document says | What it actually does |
+|---|---|---|
+| `31039~31040` | Inverter output apparent power | Tracks **P** within 1–2 W (419 VA vs 417 W, 425 VA vs 424 W) — it looks like `P / power_factor`. True apparent power is `V·I`, which agrees with `√(P²+Q²)` at ≈ 470 VA, about 50 VA higher. Compute `√(P²+Q²)` for a VA sensor. |
+| `31022` | Power factor | Sits at a near-constant `0.999`. It equals `P / (31039~31040)` but contradicts `P/√(P²+Q²) ≈ 0.89`. The vendor cloud publishes the same `0.999`, so this is a setpoint rather than a measurement — see the writable `46056 Power factors adjust`. |
+| `33002` | Meter R-phase current, scale `0.1` | `14 → 1.4 A` implies `V·I ≈ 327 VA` while meter P reads 0–1 W and Q reads 25 var. A `0.01` scale (`0.14 A` → 33 VA) fits instead. Voltage and power both agree with the cloud. |
+| `33020` | Meter power factor, scale `0.01` | Self-consistent — it is `≈ P/√(P²+Q²)` with P at a fraction of a watt — but in self-consumption mode grid exchange is near zero, so the number carries no information. |
+| `30211` | DSP warning 5, "more details in Appendix 11" | **Not a bit field.** Appendix 1 / Chart 11 is a table of decimal warning codes. |
+
+**The warning codes.** `30207`–`30210` are four ordinary bit-field words
+(Charts 8–10). Chart 11 addresses their *combined* space as
+`201 + 16·word_index + bit_index` — that formula reproduces every row of the
+chart (201/204/213 from word 0, 219/225/230 from word 1, 241/247 from word 2),
+which is what shows `30211` carries a code rather than a mask. The first
+possible code is therefore 201, so the value **200 means no warning** — which
+is what a healthy unit reports.
 
 ## Tested with
 

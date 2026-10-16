@@ -25,8 +25,8 @@ from .client import DEFAULT_PORT, Device, DongleClient, DongleError, DongleInfo
 from .crc import crc16, crc16_bytes
 from .crypto import EnvelopeError, Keys, derive_keys, open_envelope, seal
 from .decode import decode
-from .framing import (MAX_REGISTERS, HEADER, Frame, ModbusError, build_read,
-                      parse_read_reply, wrap_payload)
+from .framing import (MAX_REGISTERS, HEADER, DongleNoDataError, Frame,
+                      ModbusError, build_read, parse_read_reply, wrap_payload)
 from .registers import REGISTERS, Register, blocks
 
 __version__ = "0.1.0"
@@ -37,6 +37,7 @@ __all__ = [
     "DongleClient",
     "DongleError",
     "DongleInfo",
+    "DongleNoDataError",
     "EnvelopeError",
     "Frame",
     "HEADER",
