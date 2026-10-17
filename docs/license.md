@@ -36,7 +36,8 @@ describes observed behaviour; it is not derived from the vendor's source code.
 
 ## Disclaimer regarding the protocol
 
-!!!danger "Unofficial project"
+!!!danger Unofficial project
     This project is **not** affiliated with, endorsed by, or supported by
     SiNeng, FuturaPulse, or Sit Solar. Use it at your own risk, on your own
     equipment.
+!!!
