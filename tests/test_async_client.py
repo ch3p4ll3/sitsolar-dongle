@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
 
 import pytest
 
@@ -26,7 +27,7 @@ from sitsolar_dongle.session import (
     seal_frame,
 )
 
-SERIAL = "300018101261010226"
+SERIAL = "TESTDONGLE0000001"
 
 
 def first_block_start() -> int:
@@ -47,21 +48,36 @@ async def wait_until(predicate, timeout: float = 2.0) -> None:
 
 
 class FakeDongle:
-    """A scripted dongle: real crypto, canned replies."""
+    """A scripted dongle: real crypto, canned replies.
 
-    def __init__(self, serial: str = SERIAL, *, registers: dict[int, int] | None = None,
+    The fault-injection flags exist so the failure paths can be tested
+    without hardware: ``accredit_refused`` and ``corrupt_envelope`` reproduce
+    the two ways a handshake can fail after the socket is already open, and
+    ``reply_delay`` holds a reply long enough to cancel a read mid-frame.
+    """
+
+    def __init__(self, serial: str = SERIAL, *,
+                 registers: dict[int, int] | None = None,
                  refuse: set[int] | None = None, push_before_read: bool = False,
+                 accredit_refused: bool = False, corrupt_envelope: bool = False,
+                 reply_delay: float = 0.0,
                  host: str = "127.0.0.1") -> None:
         self.serial = serial
         self.keys = derive_keys(serial)
         self.registers = registers or {}
         self.refuse = refuse or set()
         self.push_before_read = push_before_read
+        self.accredit_refused = accredit_refused
+        self.corrupt_envelope = corrupt_envelope
+        self.reply_delay = reply_delay
         self.host = host
         self.port = 0
         self.heartbeats = 0
         self.pushed = False
+        self.disconnects = 0
+        self.connections = 0
         self.requests: list[bytes] = []
+        self._writers: set[asyncio.StreamWriter] = set()
         self._server: asyncio.Server | None = None
 
     async def __aenter__(self) -> FakeDongle:
@@ -72,11 +88,20 @@ class FakeDongle:
     async def __aexit__(self, *exc: object) -> None:
         assert self._server is not None
         self._server.close()
+        # Server.wait_closed() waits for the handlers, so a client a test
+        # forgot to close would hang the fixture instead of failing it.
+        for writer in list(self._writers):
+            try:
+                writer.close()
+            except OSError:
+                pass
         await self._server.wait_closed()
 
     # -- protocol ------------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
+        self.connections += 1
+        self._writers.add(writer)
         try:
             while True:
                 header = await reader.readexactly(7)
@@ -101,18 +126,34 @@ class FakeDongle:
                 reply = self._reply_for(payload)
                 if reply is None:
                     continue
-                writer.write(seal_frame(reply, self.keys, tid=tid))
+                if self.reply_delay and payload[:6] == HEADER:
+                    # hold only register reads, so a handshake stays quick
+                    await asyncio.sleep(self.reply_delay)
+                writer.write(self._seal_reply(reply, tid))
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError, EnvelopeError):
             pass
         finally:
+            self.disconnects += 1
+            self._writers.discard(writer)
             writer.close()
+
+    def _seal_reply(self, reply: bytes, tid: int) -> bytes:
+        wire = seal_frame(reply, self.keys, tid=tid)
+        if not self.corrupt_envelope:
+            return wire
+        broken = bytearray(wire)
+        broken[-1] ^= 0xFF          # flip a byte of the HMAC, length intact
+        return bytes(broken)
 
     def _reply_for(self, payload: bytes) -> bytes | None:
         if payload[:2] == CMD_BEFORE_ACCREDIT[:2]:
             return self._info_payload()
         if payload[:2] == CMD_ACCREDIT[:2]:
-            return bytes.fromhex("42030000")     # result 0 = accepted
+            # the client reads the result from byte 2
+            if self.accredit_refused:
+                return bytes.fromhex("420301")     # result 1 = refused
+            return bytes.fromhex("420300")         # result 0 = accepted
         if payload[:2] == CMD_CALL_ALL:
             return CMD_CALL_ALL + (b'{"devInfo":{"factory":"SiNeng",'
                                    b'"model":"3K-HS","sn":"%s",'
@@ -315,6 +356,102 @@ def test_timeout_closes_the_connection() -> None:
         finally:
             server.close()
             await server.wait_closed()
+
+    asyncio.run(main())
+
+
+def test_protocol_errors_share_one_base() -> None:
+    """Everything the dongle can do wrong is catchable as DongleError.
+
+    ``EnvelopeError``, ``ModbusError`` and ``DongleNoDataError`` used to
+    derive straight from ``Exception``, so a caller catching ``DongleError``
+    missed a bad HMAC entirely and the connection leaked.
+    """
+    from sitsolar_dongle import DongleNoDataError, EnvelopeError, ModbusError
+
+    assert issubclass(EnvelopeError, DongleError)
+    assert issubclass(ModbusError, DongleError)
+    assert issubclass(DongleNoDataError, DongleError)
+    # they stay distinct so finer-grained handlers keep working
+    assert EnvelopeError is not DongleError
+    assert ModbusError is not DongleError
+
+
+def test_failed_handshake_closes_the_connection() -> None:
+    """A refused Accredit must not leave the socket pinned open.
+
+    ``async with`` never runs ``__aexit__`` when ``__aenter__`` raises, so
+    ``connect()`` has to clean up after itself.  The dongle refuses fresh
+    connections for roughly 75 s afterwards, which makes a leaked socket
+    expensive.
+    """
+    async def main() -> None:
+        async with FakeDongle(accredit_refused=True) as dongle:
+            client = AsyncDongleClient(dongle.host, SERIAL,
+                                       port=dongle.port, timeout=1.0)
+            with pytest.raises(DongleError, match="Accredit refused"):
+                await client.connect()
+            assert not client.connected
+            # the server saw its peer go away rather than sit on the socket
+            await wait_until(lambda: dongle.disconnects == 1)
+
+    asyncio.run(main())
+
+
+def test_bad_hmac_is_a_dongle_error_and_closes() -> None:
+    """A corrupted envelope raises EnvelopeError, which is a DongleError."""
+    async def main() -> None:
+        async with FakeDongle(corrupt_envelope=True) as dongle:
+            client = AsyncDongleClient(dongle.host, SERIAL,
+                                       port=dongle.port, timeout=1.0)
+            with pytest.raises(DongleError, match="HMAC mismatch"):
+                await client.connect()
+            assert not client.connected
+            await wait_until(lambda: dongle.disconnects == 1)
+
+    asyncio.run(main())
+
+
+def test_connection_refusal_is_a_dongle_error() -> None:
+    """A refused socket surfaces as DongleError, not a bare OSError."""
+
+    async def main() -> None:
+        # nothing is listening on port 1
+        client = AsyncDongleClient("127.0.0.1", SERIAL, port=1, timeout=1.0)
+        with pytest.raises(DongleError, match="cannot connect"):
+            await client.connect()
+        assert not client.connected
+
+    asyncio.run(main())
+
+
+def test_cancellation_drops_the_connection() -> None:
+    """A read cancelled mid-frame must not leave a torn stream behind.
+
+    Wrapping a call in ``asyncio.timeout`` and letting it expire is the
+    normal Home Assistant pattern.  Without the drop, the next read would
+    sit waiting for the rest of the torn frame and then burn the whole
+    timeout before failing.
+    """
+    async def main() -> None:
+        async with FakeDongle(reply_delay=5.0) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port,
+                                         timeout=10.0) as client:
+                task = asyncio.create_task(client.read(31002, 2))
+                await asyncio.sleep(0.2)          # let it get into _take
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+                assert not client.connected
+
+                # a fresh connect starts clean rather than inheriting the
+                # half-read frame
+                started = time.monotonic()
+                info = await client.connect()
+                assert info.serial == SERIAL
+                assert time.monotonic() - started < 2.0
 
     asyncio.run(main())
 

@@ -27,6 +27,7 @@ import struct
 from dataclasses import dataclass
 
 from .crc import crc16_bytes
+from .errors import DongleError
 
 __all__ = [
     "HEADER",
@@ -54,8 +55,11 @@ FC_READ_HOLDING = 0x03
 FC_READ_INPUT = 0x04
 
 
-class ModbusError(Exception):
-    """The slave answered with a Modbus exception."""
+class ModbusError(DongleError):
+    """The slave answered with a Modbus exception.
+
+    Subclass of :class:`~sitsolar_dongle.errors.DongleError`.
+    """
 
     def __init__(self, code: int, slave: int, fc: int) -> None:
         self.code = code
@@ -65,7 +69,7 @@ class ModbusError(Exception):
                          % (slave, ERROR_NAMES.get(code, "unknown error"), code, fc))
 
 
-class DongleNoDataError(Exception):
+class DongleNoDataError(DongleError):
     """The dongle answered a bare ``64 07 <status>`` stub instead of a frame.
 
     The success prefix is ``64 07 00`` followed by the Modbus reply; when the

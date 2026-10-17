@@ -10,13 +10,19 @@ types.  Written for Home Assistant and other asyncio applications:
 * concurrent callers are serialised with an :class:`asyncio.Lock`, because a
   Modbus request/reply pair cannot be interleaved on one connection;
 * every read is bounded by ``timeout``;
-* a connection that times out or is closed mid-frame **closes itself**, so a
-  half-received frame can never desync the next request -- reconnect with
-  :meth:`connect`.
+* **every** failure surfaces as :class:`~sitsolar_dongle.errors.DongleError`
+  -- refused accreditation, bad HMAC, Modbus exception, refused connection or
+  timeout -- so one ``except`` covers the lot;
+* anything that interrupts a read, including the caller cancelling the task,
+  drops the connection rather than leaving a half-read frame on the stream.
+  Reconnect with :meth:`connect`.
 
-The dongle sends unsolicited heartbeat pushes (``0x43 0x01``).  They are
-answered as and when frames are read, exactly like the blocking client and
-the official app; the replies simply sit in the TCP buffer between polls.
+The dongle sends unsolicited heartbeat pushes (``0x43 0x01``, roughly 37 s
+apart in the captures this was written from).  They are answered as and when
+frames are read, exactly like the blocking client and the official app, so
+between polls the replies simply accumulate in the TCP buffer.  That is fine
+for polling intervals shorter than the heartbeat period; if you intend to
+leave a connection idle for minutes at a time, reconnect per poll instead.
 """
 
 from __future__ import annotations
@@ -24,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
 from typing import Any
 
 from .framing import (
@@ -89,27 +94,59 @@ class AsyncDongleClient(ClientCore):
         return self._writer is not None and not self._writer.is_closing()
 
     async def connect(self) -> DongleInfo:
-        """Open the connection and run the accreditation handshake."""
+        """Open the connection and run the accreditation handshake.
+
+        A connection that fails to open, or that opens and then fails the
+        handshake, is dropped before this raises.  Otherwise a refused
+        ``Accredit`` would leave the socket pinned open -- and with
+        ``async with`` the exit hook never runs when the entry hook raises,
+        so nothing else would close it.  The dongle then refuses new
+        connections for roughly 75 s, which makes a leaked socket expensive.
+        """
         await self.close()
-        self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port), self.timeout)
-        self.info = await self.handshake()
+        try:
+            self._reader, self._writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port), self.timeout)
+        except asyncio.TimeoutError as exc:
+            raise DongleError("timed out connecting to %s:%d"
+                              % (self.host, self.port)) from exc
+        except OSError as exc:
+            raise DongleError("cannot connect to %s:%d: %s"
+                              % (self.host, self.port, exc)) from exc
+
+        try:
+            self.info = await self.handshake()
+        except BaseException:
+            self._drop()
+            raise
         return self.info
 
     async def close(self) -> None:
         """Close the connection, if any."""
-        writer, self._writer = self._writer, None
-        self._reader = None
+        writer = self._writer
+        self._drop()
         if writer is None:
-            return
-        try:
-            writer.close()
-        except OSError:
             return
         try:
             await writer.wait_closed()
         except (OSError, ConnectionError):
             pass
+
+    def _drop(self) -> None:
+        """Drop the connection immediately, awaiting nothing.
+
+        Deliberately synchronous so it is safe from a ``except BaseException``
+        handler, including while the task is being cancelled:
+        ``writer.close()`` initiates the close without yielding, so the
+        transport stops even if we are never scheduled again.
+        """
+        writer, self._writer = self._writer, None
+        self._reader = None
+        if writer is not None:
+            try:
+                writer.close()
+            except OSError:
+                pass
 
     # -- low level ------------------------------------------------------
     async def _send(self, payload: bytes, *, tid: int | None = None) -> int:
@@ -123,10 +160,13 @@ class AsyncDongleClient(ClientCore):
     async def _take(self, size: int) -> bytes:
         """Read exactly *size* bytes, or drop the connection and fail.
 
-        On a timeout the pending ``readexactly`` is cancelled while part of a
-        frame may already have been consumed, so the stream can no longer be
-        trusted -- the connection is closed to guarantee the next request
-        starts from a clean frame boundary.
+        Anything that interrupts the read -- a timeout, the peer going away,
+        or the caller cancelling the task -- can leave a partially consumed
+        frame on the stream, so the connection is dropped rather than reused.
+        A cancelled read is the easy one to miss: wrapping a call in
+        ``asyncio.timeout`` and letting it expire is the normal Home
+        Assistant pattern, and without this the next request would sit
+        waiting for the rest of the torn frame.
         """
         if self._reader is None:
             raise DongleError("not connected")
@@ -134,15 +174,25 @@ class AsyncDongleClient(ClientCore):
             return await asyncio.wait_for(self._reader.readexactly(size),
                                           self.timeout)
         except asyncio.IncompleteReadError:
-            await self.close()
+            self._drop()
             raise DongleError("connection closed by the dongle") from None
         except asyncio.TimeoutError:
-            await self.close()
+            self._drop()
             raise DongleError("no data from %s for %.1fs"
                               % (self.host, self.timeout)) from None
+        except BaseException:
+            # cancellation, or anything unforeseen: never trust the stream
+            self._drop()
+            raise
 
-    async def _iter_frames(self) -> AsyncIterator[Frame]:
-        """Yield frames off the wire, transparently answering heartbeats."""
+    async def _next_frame(self) -> Frame:
+        """Read the next non-push frame, answering heartbeats as they arrive.
+
+        A plain coroutine rather than an async generator: callers loop over
+        this with ``while True`` and ``break``/``return``, and an abandoned
+        async generator would only be closed once the event loop got round to
+        finalising it.
+        """
         while True:
             header = await self._take(7)
             tid, protocol, length, unit = parse_header(header)
@@ -154,7 +204,7 @@ class AsyncDongleClient(ClientCore):
             if frame.is_push:
                 await self._answer_push(frame)
                 continue
-            yield frame
+            return frame
 
     async def _answer_push(self, frame: Frame) -> None:
         """Reply to a heartbeat push exactly like the official app does."""
@@ -181,7 +231,8 @@ class AsyncDongleClient(ClientCore):
             deadline = time.monotonic() + self.timeout
             out: list[bytes] = []
             pending = expect_tids
-            async for frame in self._iter_frames():
+            while True:
+                frame = await self._next_frame()
                 if frame.tid != tid:
                     # a late push already handled itself; ignore the rest
                     continue
@@ -246,7 +297,8 @@ class AsyncDongleClient(ClientCore):
         payload = build_read(target, address, count, fc=fc)
         async with self._lock:
             tid = await self._send(payload)
-            async for frame in self._iter_frames():
+            while True:
+                frame = await self._next_frame()
                 if frame.tid != tid:
                     continue
                 reply = parse_read_reply(self._open(frame))

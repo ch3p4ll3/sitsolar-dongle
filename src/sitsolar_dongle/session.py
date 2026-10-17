@@ -16,6 +16,7 @@ from typing import Any
 
 from .crypto import Keys, derive_keys, open_envelope, seal
 from .decode import decode
+from .errors import DongleError
 from .framing import PROTO_REQUEST, Frame, wrap_payload
 from .registers import REGISTERS
 
@@ -53,10 +54,6 @@ CMD_HEARTBEAT = bytes.fromhex("4301")
 
 # The app answers a heartbeat with protocol id 0x1001 (WifiTcpService.m50).
 PROTO_HEARTBEAT_REPLY = 0x1001
-
-
-class DongleError(Exception):
-    """Protocol-level failure talking to the dongle."""
 
 
 @dataclass(frozen=True)

@@ -189,13 +189,36 @@ Concurrent callers are serialised by an `asyncio.Lock`, so two tasks awaiting
 Every read is bounded by `timeout`.
 !!!
 
-!!!warning A failed connection closes itself
-A connection that times out, or is closed mid-frame, is closed by the client
-rather than left half-read — a partially consumed frame could never be
-trusted for the next request. Call `await connect()` to reopen.
+!!!success Every failure is a `DongleError`
+A refused connection, a refused `Accredit`, a bad HMAC, a Modbus exception or
+a timeout all surface as `DongleError`, so one `except` covers them — see
+[Exceptions](#exceptions). A caller cannot accidentally miss one and leak the
+connection.
 !!!
 
-!!!success One client per dongle
+!!!warning A failed or interrupted connection closes itself
+Anything that interrupts a read — a timeout, the peer going away, a bad
+envelope, or **the caller cancelling the task** — drops the connection rather
+than leaving a half-read frame on the stream. Reconnect with `await connect()`.
+
+Cancelling matters in practice: wrapping a call in `asyncio.timeout` and
+letting it expire is the normal Home Assistant pattern, and without the drop
+the next request would sit waiting for the rest of the torn frame and then
+burn a full `timeout` before failing.
+
+The drop is synchronous (`writer.close()`), so it works from a cancellation
+handler that may never be scheduled again.
+!!!
+
+!!!info Heartbeats are answered while a read is in flight
+The dongle pushes a heartbeat roughly every 37 s in the captures this was
+written from. Between polls those pushes accumulate in the TCP buffer and get
+answered on the next read. That is fine for polling intervals shorter than
+the heartbeat period; if you intend to leave a connection idle for minutes,
+reconnect per poll instead of holding one open.
+!!!
+
+!!!warning One client per dongle
 The lock serialises requests *within* a client. To poll several dongles,
 create one `AsyncDongleClient` per device: nothing is shared globally, so they
 all run concurrently.
@@ -210,6 +233,7 @@ library never pins you to one HA release. Wire it into an integration with a
 ```python
 from datetime import timedelta
 import logging
+import time
 
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -217,18 +241,31 @@ from sitsolar_dongle import AsyncDongleClient, DongleError
 
 _LOGGER = logging.getLogger(__name__)
 
+# The dongle stops accepting fresh connections for roughly 75 s after a
+# connection drops, so retrying on every 15-second tick would only ever
+# collide with that lockout.
+RECONNECT_AFTER = 75.0
+
 
 async def async_setup_entry(hass, entry, async_add_entities):
     dongle = AsyncDongleClient(entry.data["host"], entry.data["serial"],
                                timeout=10.0)
+    state = {"retry_after": 0.0}
 
     async def async_update():
-        try:
-            if not dongle.connected:
+        if not dongle.connected:
+            if time.monotonic() < state["retry_after"]:
+                raise UpdateFailed("waiting out the reconnect lockout")
+            try:
                 await dongle.connect()
+            except DongleError as exc:
+                state["retry_after"] = time.monotonic() + RECONNECT_AFTER
+                raise UpdateFailed(str(exc)) from exc
+        try:
             return await dongle.poll()
         except DongleError as exc:
-            await dongle.close()      # drop the broken connection
+            await dongle.close()          # drop the broken connection
+            state["retry_after"] = time.monotonic() + RECONNECT_AFTER
             raise UpdateFailed(str(exc)) from exc
 
     coordinator = DataUpdateCoordinator(
@@ -248,6 +285,18 @@ async def async_setup_entry(hass, entry, async_add_entities):
 `connect()` reopens cleanly, but a stale connection is silently useless.
 Closing when the refresh fails makes the next attempt start from a fresh
 handshake, and the coordinator marks the entities unavailable in between.
+
+Because `connect()` now drops the socket on *any* handshake failure, a
+refused `Accredit` or a bad HMAC cannot leave a connection pinned open while
+`connected` still reports `True`.
+!!!
+
+!!!warning Back off after a failure, do not just retry
+The ~75 s lockout in [Caveats](caveats.md#one-connection-at-a-time) means a
+naive 15-second retry loop spends its whole life being refused. The
+`retry_after` timestamp above keeps the coordinator honest: it keeps
+reporting the entities unavailable instead of opening a connection the
+dongle will reject anyway.
 !!!
 
 !!!warning Do not block the coordinator
@@ -302,13 +351,34 @@ The CRC16 of the serial, exposed for cross-checking.
 
 All are exported from the package root.
 
+Every protocol-level failure derives from `DongleError`, so one `except` is
+enough:
+
+```python
+try:
+    values = await dongle.poll()
+except DongleError as exc:
+    # refused accreditation, bad HMAC, Modbus exception, refused
+    # connection, timeout or a dropped socket -- all of them
+    print("dongle failed:", exc)
+```
+
 | Exception | Raised when |
 |---|---|
-| `DongleError` | Protocol-level failure — not connected, no reply, refused `Accredit`, truncated frame, connection closed. |
+| `DongleError` | **Base class** for every dongle failure — not connected, no reply, refused `Accredit`, truncated frame, connection closed, connection refused or timed out. |
 | `ModbusError` | The slave answered with a Modbus exception. Carries `code`, `slave`, and `fc`. |
 | `DongleNoDataError` | The dongle answered a bare `64 07 <status>` stub instead of a frame. Carries `status`. |
 | `EnvelopeError` | A frame failed authentication or could not be decrypted. |
-| `ValueError` | Invalid arguments, e.g. `count` outside `1..50`. |
+| `ValueError` | Invalid arguments, e.g. `count` outside `1..50`. Not a dongle failure — it means the call itself was wrong. |
+
+!!!success `ModbusError`, `DongleNoDataError` and `EnvelopeError` subclass `DongleError`
+`except DongleError` catches all of them, which matters for the async client
+in particular: an uncaught `EnvelopeError` would otherwise skip the
+connection cleanup and leave the socket open. Catch one on its own only when
+you need to tell them apart. `ValueError` is deliberately *not* a
+`DongleError`, since it is a programming mistake rather than the device
+misbehaving.
+!!!
 
 !!!warning `ModbusError` and `DongleNoDataError` are different failures
 A `DongleNoDataError` is a **dongle-level** refusal: it has no data for that

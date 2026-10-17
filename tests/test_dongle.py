@@ -1,6 +1,6 @@
 """Tests for the vendor CRC16 and the AES/HMAC envelope.
 
-Run with ``pytest`` or directly with ``python -m sitsolar_dongle.tests``.
+Run with ``pytest``.
 """
 
 from __future__ import annotations

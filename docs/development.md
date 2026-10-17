@@ -23,14 +23,18 @@ dongle-reader/
 │   ├── __init__.py            Public API surface
 │   ├── __main__.py            `python -m sitsolar_dongle`
 │   ├── cli.py                 Command-line interface
-│   ├── client.py              DongleClient: session, handshake, reads
+│   ├── client.py              DongleClient: blocking transport
+│   ├── async_client.py        AsyncDongleClient: asyncio transport
+│   ├── session.py             ClientCore: logic shared by both clients
+│   ├── errors.py              DongleError, the base exception
 │   ├── crypto.py              Key derivation + AES/HMAC envelope
 │   ├── crc.py                 Vendor CRC16 + selftest
 │   ├── framing.py             Header, inner RTU frames, error types
 │   ├── decode.py              Raw words -> decoded readings
 │   └── registers.py           The register map
 └── tests/
-    └── test_dongle.py         CRC vectors, framing, decoding
+    ├── test_dongle.py         CRC vectors, framing, decoding
+    └── test_async_client.py   Async client against a scripted dongle
 ```
 
 ---
@@ -41,34 +45,47 @@ Requests flow through four layers, each with one job:
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| Session | `client.py` | Socket lifecycle, handshake, heartbeat replies, tid matching. |
+| Transport | `client.py`, `async_client.py` | Socket/streams, handshake, heartbeat replies, tid matching. |
+| Session | `session.py` | `ClientCore`, shared by both transports: key setup, frame sealing, `BeforeAccredit`/`CallAll` parsing, `poll()` assembly. |
 | Framing | `framing.py` | Outer header, inner Modbus RTU frame, error taxonomy. |
 | Envelope | `crypto.py`, `crc.py` | AES-128-CBC + HMAC-SHA256, key derivation, CRC16. |
 | Semantics | `registers.py`, `decode.py` | What each register means and how to turn words into values. |
 
+The two transports implement only the bytes on and off the wire. Anything
+they would otherwise duplicate — the handshake parsing, `seal_frame()`, the
+refused-range bookkeeping in `poll()` — lives in `ClientCore`, so the blocking
+and asyncio clients cannot drift apart.
+
 Two design points are worth calling out:
 
-**Heartbeats are answered inside the frame iterator.** `_iter_frames()` pops
+**Heartbeats are answered while frames are being read.** The frame reader pops
 frames off the wire and, on seeing a push, answers it and continues — so a
-heartbeat can never be mistaken for a reply, and pushes never pile up. Callers
-see only frames matching their transaction id.
+heartbeat can never be mistaken for a reply, and callers see only frames
+matching their transaction id.
+
+What that does *not* cover is the idle gap between polls: nothing reads while
+no request is in flight, so pushes accumulate in the TCP buffer and are
+answered in a burst on the next read. That is fine at polling intervals
+shorter than the ~37 s heartbeat period seen in our captures, but whether the
+dongle tolerates a client that stays silent for minutes has not been tested.
 
 **Sealing rebuilds the header by hand.** The outer 7-byte header must survive in
 the clear while the protocol id is patched from `0x0000` to `0x1000` *after*
-encryption. `_seal_frame()` therefore splits the header off, seals the payload,
+encryption. `seal_frame()` therefore splits the header off, seals the payload,
 rejoins, and patches the protocol and length fields — mirroring `utils.a.m58`.
+Both clients reach it through `ClientCore._seal()`.
 
 ---
 
 ## Running the tests
 
-The suite needs no `pytest`:
+`test_dongle.py` needs nothing beyond the package itself:
 
 ```bash
 PYTHONPATH=src python tests/test_dongle.py
 ```
 
-Or, if you installed the dev extra:
+The async client tests use `pytest.raises`, so run the whole suite with:
 
 ```bash
 pytest tests/
@@ -100,6 +117,14 @@ corrupted. The tables are pinned by tests for exactly this reason.
 
 `sitsolar_dongle.crc.selftest()` also runs at import time and refuses to start
 the module if the tables fail.
+
+`tests/test_async_client.py` takes a different approach: it runs the asyncio
+client against an **in-process scripted dongle** that derives the same keys,
+decrypts the real frames the client sends, and answers `BeforeAccredit`,
+`Accredit`, `CallAll` and FC reads the way the hardware does. That is what
+makes the failure paths testable without hardware — a refused `Accredit`, a
+corrupted HMAC, a reply that never arrives, and a read cancelled mid-frame are
+all driven by fault-injection flags on the fake.
 
 ---
 
