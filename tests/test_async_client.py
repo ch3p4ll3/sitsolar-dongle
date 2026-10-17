@@ -52,15 +52,18 @@ class FakeDongle:
 
     The fault-injection flags exist so the failure paths can be tested
     without hardware: ``accredit_refused`` and ``corrupt_envelope`` reproduce
-    the two ways a handshake can fail after the socket is already open, and
-    ``reply_delay`` holds a reply long enough to cancel a read mid-frame.
+    the two ways a handshake can fail after the socket is already open,
+    ``reply_delay`` holds a reply long enough to cancel a read mid-frame, and
+    ``stall_after_header`` sends a header and then nothing, which is what a
+    frame torn halfway really looks like on the wire.
     """
 
     def __init__(self, serial: str = SERIAL, *,
                  registers: dict[int, int] | None = None,
                  refuse: set[int] | None = None, push_before_read: bool = False,
                  accredit_refused: bool = False, corrupt_envelope: bool = False,
-                 reply_delay: float = 0.0,
+                 corrupt_reads: bool = False,
+                 reply_delay: float = 0.0, stall_after_header: bool = False,
                  host: str = "127.0.0.1") -> None:
         self.serial = serial
         self.keys = derive_keys(serial)
@@ -69,11 +72,15 @@ class FakeDongle:
         self.push_before_read = push_before_read
         self.accredit_refused = accredit_refused
         self.corrupt_envelope = corrupt_envelope
+        self.corrupt_reads = corrupt_reads
         self.reply_delay = reply_delay
+        self.stall_after_header = stall_after_header
         self.host = host
         self.port = 0
         self.heartbeats = 0
         self.pushed = False
+        self.stalled = False
+        self.corrupted = False
         self.disconnects = 0
         self.connections = 0
         self.requests: list[bytes] = []
@@ -129,7 +136,20 @@ class FakeDongle:
                 if self.reply_delay and payload[:6] == HEADER:
                     # hold only register reads, so a handshake stays quick
                     await asyncio.sleep(self.reply_delay)
-                writer.write(self._seal_reply(reply, tid))
+                wire = self._seal_reply(
+                    reply, tid,
+                    corrupt=bool(self.corrupt_reads and payload[:6] == HEADER
+                                 and not self.corrupted))
+                if self.corrupt_reads and payload[:6] == HEADER:
+                    self.corrupted = True
+                if (self.stall_after_header and payload[:6] == HEADER
+                        and not self.stalled):
+                    # header reaches the client, the body never does
+                    self.stalled = True
+                    writer.write(wire[:7])
+                    await writer.drain()
+                    await asyncio.sleep(3600)
+                writer.write(wire)
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError, EnvelopeError):
             pass
@@ -138,9 +158,10 @@ class FakeDongle:
             self._writers.discard(writer)
             writer.close()
 
-    def _seal_reply(self, reply: bytes, tid: int) -> bytes:
+    def _seal_reply(self, reply: bytes, tid: int, *,
+                    corrupt: bool = False) -> bytes:
         wire = seal_frame(reply, self.keys, tid=tid)
-        if not self.corrupt_envelope:
+        if not (corrupt or self.corrupt_envelope):
             return wire
         broken = bytearray(wire)
         broken[-1] ^= 0xFF          # flip a byte of the HMAC, length intact
@@ -412,6 +433,28 @@ def test_bad_hmac_is_a_dongle_error_and_closes() -> None:
     asyncio.run(main())
 
 
+def test_bad_envelope_mid_session_keeps_the_connection() -> None:
+    """An `EnvelopeError` on a live connection does *not* drop it.
+
+    The frame is read in full before its HMAC is checked, so the stream is
+    still on a clean frame boundary and the socket stays usable. Only
+    `connect()` tears down, where the handshake has failed outright.
+    """
+    async def main() -> None:
+        async with FakeDongle(corrupt_reads=True) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port,
+                                         timeout=1.0) as client:
+                with pytest.raises(DongleError, match="HMAC mismatch"):
+                    await client.read(31002, 2)
+
+                assert client.connected
+                # the very next request on the same socket succeeds
+                assert await client.read(31002, 2) == (0, 0)
+
+    asyncio.run(main())
+
+
 def test_connection_refusal_is_a_dongle_error() -> None:
     """A refused socket surfaces as DongleError, not a bare OSError."""
 
@@ -448,6 +491,38 @@ def test_cancellation_drops_the_connection() -> None:
 
                 # a fresh connect starts clean rather than inheriting the
                 # half-read frame
+                started = time.monotonic()
+                info = await client.connect()
+                assert info.serial == SERIAL
+                assert time.monotonic() - started < 2.0
+
+    asyncio.run(main())
+
+
+def test_cancellation_after_the_header_tears_the_frame() -> None:
+    """The case that actually leaves a half-consumed frame on the stream.
+
+    Here the 7-byte header has been read and the body never arrives, so a
+    client that did not drop would spend its next read waiting for the rest
+    of a frame whose declared length it can no longer trust.
+    """
+    async def main() -> None:
+        async with FakeDongle(stall_after_header=True) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port,
+                                         timeout=10.0) as client:
+                task = asyncio.create_task(client.read(31002, 2))
+                # wait for the header to be on the wire, then give the client
+                # time to consume it and start awaiting the body
+                await wait_until(lambda: dongle.stalled)
+                await asyncio.sleep(0.2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+                assert not client.connected
+
+                # reconnecting must not inherit the stalled frame
                 started = time.monotonic()
                 info = await client.connect()
                 assert info.serial == SERIAL

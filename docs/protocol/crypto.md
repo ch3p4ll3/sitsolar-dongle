@@ -28,7 +28,7 @@ In Python, via `sitsolar_dongle.crypto.derive_keys`:
 ```python
 from sitsolar_dongle import derive_keys
 
-keys = derive_keys("300018101261010226")
+keys = derive_keys("<DONGLE_SERIAL>")
 keys.aes     # 16 bytes
 keys.hmac    # 16 bytes
 keys.crc     # CRC16 of the serial, for cross-checking
@@ -110,7 +110,7 @@ Used in exactly two places:
 ```python
 from sitsolar_dongle import crc16, crc16_bytes
 
-crc16(b"300018101261010226")        # int
+crc16(b"<DONGLE_SERIAL>")          # int
 crc16_bytes(b"\x01\x04\x75\x94")    # 2 bytes, big-endian, ready to append
 ```
 

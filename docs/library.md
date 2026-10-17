@@ -197,9 +197,10 @@ connection.
 !!!
 
 !!!warning A failed or interrupted connection closes itself
-Anything that interrupts a read — a timeout, the peer going away, a bad
-envelope, or **the caller cancelling the task** — drops the connection rather
-than leaving a half-read frame on the stream. Reconnect with `await connect()`.
+Anything that interrupts a read **mid-frame** — a timeout, the peer going
+away, or **the caller cancelling the task** — drops the connection rather
+than leaving a half-received frame on the stream. Reconnect with
+`await connect()`.
 
 Cancelling matters in practice: wrapping a call in `asyncio.timeout` and
 letting it expire is the normal Home Assistant pattern, and without the drop
@@ -210,12 +211,30 @@ The drop is synchronous (`writer.close()`), so it works from a cancellation
 handler that may never be scheduled again.
 !!!
 
+!!!info A bad envelope does *not* drop the connection
+An `EnvelopeError` means the frame was read in full and only then failed
+authentication, so the stream is still sitting on a clean frame boundary and
+the connection stays usable — `connected` remains `True` and the next request
+goes out on the same socket. Only `connect()` tears down after a failure,
+because there the handshake has failed outright and there is nothing worth
+keeping.
+!!!
+
 !!!info Heartbeats are answered while a read is in flight
 The dongle pushes a heartbeat roughly every 37 s in the captures this was
 written from. Between polls those pushes accumulate in the TCP buffer and get
-answered on the next read. That is fine for polling intervals shorter than
-the heartbeat period; if you intend to leave a connection idle for minutes,
-reconnect per poll instead of holding one open.
+answered on the next read.
+
+An interval of **30 s or less** plus one long-lived connection is the shape
+this was designed and tested around: no push backlog ever builds up, and
+nothing reconnects.
+
+Reconnecting per poll is the obvious answer for longer gaps, but it only
+becomes necessary once the idle time exceeds the heartbeat period — and for
+intervals between roughly 37 s and 75 s it walks straight into the reconnect
+lockout described in [Caveats](caveats.md#one-connection-at-a-time). What the
+dongle does with a client that stays silent for minutes has not been tested,
+so treat intervals above ~30 s as uncharacterised rather than safe.
 !!!
 
 !!!warning One client per dongle
@@ -253,20 +272,23 @@ async def async_setup_entry(hass, entry, async_add_entities):
     state = {"retry_after": 0.0}
 
     async def async_update():
-        if not dongle.connected:
-            if time.monotonic() < state["retry_after"]:
-                raise UpdateFailed("waiting out the reconnect lockout")
-            try:
-                await dongle.connect()
-            except DongleError as exc:
-                state["retry_after"] = time.monotonic() + RECONNECT_AFTER
-                raise UpdateFailed(str(exc)) from exc
         try:
+            if not dongle.connected:
+                if time.monotonic() < state["retry_after"]:
+                    raise UpdateFailed("waiting out the reconnect lockout")
+                await dongle.connect()
             return await dongle.poll()
         except DongleError as exc:
-            await dongle.close()          # drop the broken connection
-            state["retry_after"] = time.monotonic() + RECONNECT_AFTER
             raise UpdateFailed(str(exc)) from exc
+        finally:
+            # `finally`, not the except: a cancelled poll drops the connection
+            # from inside _take() without ever raising DongleError, so this
+            # is the only place that covers it.  It is also why close() is
+            # not called above -- an EnvelopeError or a ModbusError raised
+            # under on_error="raise" leaves a healthy socket that is worth
+            # keeping, and `connected` stays True so no backoff is set.
+            if not dongle.connected:
+                state["retry_after"] = time.monotonic() + RECONNECT_AFTER
 
     coordinator = DataUpdateCoordinator(
         hass, _LOGGER,
@@ -281,14 +303,16 @@ async def async_setup_entry(hass, entry, async_add_entities):
     )
 ```
 
-!!!success Why close on failure
-`connect()` reopens cleanly, but a stale connection is silently useless.
-Closing when the refresh fails makes the next attempt start from a fresh
-handshake, and the coordinator marks the entities unavailable in between.
+!!!success Let the client decide when to drop
+The client tears the connection down itself on anything that breaks the
+stream — a timeout, a closed peer, a cancelled task — so the handler above
+does not need to call `close()`. What it does need is the `finally`: a
+cancelled poll never raises `DongleError`, so checking `dongle.connected`
+after every outcome is the only way the backoff gets set for one.
 
-Because `connect()` now drops the socket on *any* handshake failure, a
-refused `Accredit` or a bad HMAC cannot leave a connection pinned open while
-`connected` still reports `True`.
+Keeping a connection that is still healthy is deliberate. An `EnvelopeError`,
+or a `ModbusError` raised under `on_error="raise"`, leaves the stream in sync,
+and tearing it down would cost a reconnect for nothing.
 !!!
 
 !!!warning Back off after a failure, do not just retry
@@ -297,6 +321,11 @@ naive 15-second retry loop spends its whole life being refused. The
 `retry_after` timestamp above keeps the coordinator honest: it keeps
 reporting the entities unavailable instead of opening a connection the
 dongle will reject anyway.
+
+Note what that costs. If the lockout really does follow *any* dropped
+connection, then a single transient failure pins the entities unavailable for
+75 s. That is the safe assumption to make — but see the caveats for what is
+and is not actually known about the trigger.
 !!!
 
 !!!warning Do not block the coordinator

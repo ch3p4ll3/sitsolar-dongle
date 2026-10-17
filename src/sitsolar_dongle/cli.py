@@ -3,13 +3,13 @@
 Examples::
 
     # one shot, human readable
-    sitsolar-dongle 192.168.1.50 --sn 300018101261010226
+    sitsolar-dongle 192.168.1.50 --sn <DONGLE_SERIAL>
 
     # machine readable
-    sitsolar-dongle 192.168.1.50 --sn 300018101261010226 --json
+    sitsolar-dongle 192.168.1.50 --sn ... --json
 
     # follow forever, one sample every 15 s
-    sitsolar-dongle 192.168.1.50 --sn 300018101261010226 --interval 15
+    sitsolar-dongle 192.168.1.50 --sn ... --interval 15
 
     # raw reads, bypassing the register map
     sitsolar-dongle 192.168.1.50 --sn ... --read 31002:2 --read 30100:1

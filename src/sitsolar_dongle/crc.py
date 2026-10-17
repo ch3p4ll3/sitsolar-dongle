@@ -94,6 +94,8 @@ def selftest() -> None:
         b"\x00": 0xBF40,
         b"123456789": 0x374B,
         b"Modbus": 0x0254,
+        # A real Si-Dongle-L serial.  Kept so this vector stays grounded in a
+        # device rather than being self-computed -- see tests/test_dongle.py.
         b"300018101261010226": 0x6E41,
         # inner part of a real FC03 reply captured from a Si-Dongle-L
         bytes.fromhex("00030a000100006ad26e1f0001"): 0x7651,

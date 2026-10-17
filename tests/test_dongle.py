@@ -29,6 +29,11 @@ from sitsolar_dongle import (
 from sitsolar_dongle.registers import REGISTERS, U32, blocks
 
 # Keys and vectors taken from a real Si-Dongle-L, serial 300018101261010226.
+#
+# The serial is deliberately kept rather than scrubbed to a placeholder: the
+# value of EXPECTED_AES / EXPECTED_HMAC is that the *device* produced them, so
+# a synthetic serial would turn the derivation check into a tautology. Where
+# the serial is mere example text it uses <DONGLE_SERIAL> instead.
 SERIAL = "300018101261010226"
 EXPECTED_AES = bytes.fromhex("d071827be8017016b83df98ee6b34e2f")
 EXPECTED_HMAC = bytes.fromhex("0af59496ba8946d1d83d7b23e1ce7548")

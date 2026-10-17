@@ -16,6 +16,20 @@ dongle and its firmware. Knowing them up front saves a lot of confusion.
 The dongle stops accepting new TCP connections for roughly **75 seconds** after
 a rapid reconnect.
 
+!!!warning What actually triggers it is not pinned down
+Two readings of the same observation are in circulation in this documentation:
+that the lockout follows a *rapid reconnect*, and that it follows *any* dropped
+connection. Only the first has been observed directly, and neither has been
+tested systematically — settling it needs an hour on real hardware, which we
+have not had.
+
+The distinction matters. Under the pessimistic reading a single transient
+failure pins a Home Assistant integration unavailable for 75 s; under the
+optimistic one, a clean close followed by a deliberate reconnect is harmless.
+Everything here assumes the pessimistic reading, so anything that fails should
+back off rather than retry on the next tick.
+!!!
+
 | Do | Don't |
 |---|---|
 | Keep each session on a **single socket**. | Open a new connection per sample. |
