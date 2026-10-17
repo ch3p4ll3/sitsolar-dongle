@@ -44,6 +44,7 @@ jobs:
       # here. If the project ever outgrows the free tier, add a RETYPE_KEY
       # repository secret and it will be picked up automatically.
       - name: Build with Retype
+        id: retype
         uses: retypeapp/action-build@v4
         env:
           RETYPE_KEY: ${{ secrets.RETYPE_KEY }}
@@ -51,8 +52,8 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          # The output directory configured in retype.yml.
-          path: .retype
+          # Output directory reported by the Retype build action above.
+          path: ${{ steps.retype.outputs.retype-output-path }}
 
   deploy:
     name: Deploy to GitHub Pages
