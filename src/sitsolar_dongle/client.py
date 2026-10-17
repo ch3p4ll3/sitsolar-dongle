@@ -14,94 +14,38 @@ The dongle also emits unsolicited heartbeat pushes (``0x43 0x01`` + a 4-byte
 unix timestamp, protocol id ``0x0001``).  The app answers each one with a
 heartbeat of its own, reusing the push's transaction id, so this client does
 the same rather than letting the pushes pile up.
+
+For asyncio applications (Home Assistant, long-running services) use
+:class:`sitsolar_dongle.async_client.AsyncDongleClient` instead -- this class
+blocks and must not be called from an event loop.
 """
 
 from __future__ import annotations
 
 import json
 import socket
-import struct
 import time
-from dataclasses import dataclass
 from typing import Any, Iterator
 
-from . import framing
-from .crypto import Keys, derive_keys, open_envelope, seal
-from .decode import decode
-from .framing import DongleNoDataError, Frame, ModbusError, build_read, \
-    parse_header, parse_read_reply, wrap_payload
-from .registers import REGISTERS, blocks
+from .framing import (DongleNoDataError, FC_READ_INPUT, Frame, ModbusError,
+                      build_read, parse_header, parse_read_reply)
+from .registers import blocks
+from .session import (CMD_ACCREDIT, CMD_BEFORE_ACCREDIT, CMD_CALL_ALL,
+                      CMD_HEARTBEAT, DEFAULT_PORT, ClientCore, Device,
+                      DongleError, DongleInfo, parse_dongle_info)
 
 __all__ = ["DongleClient", "DongleInfo", "Device", "DongleError"]
 
-DEFAULT_PORT = 7078
 
-# tcp/BeforeAccredit.json -> functionCode "66" (=0x42), ChildFunctionCode "2",
-# nameLen 8, name "general\0".  Function codes are parsed as decimal by the
-# app (TcpParamBean.getWriteDataHex uses Integer.parseInt with no radix), so
-# the template's "66" is 0x42 on the wire.
-_BEFORE_ACCREDIT = bytes.fromhex("42020008") + b"general\x00"
-
-# tcp/Accredit.json -> same, ChildFunctionCode "3", plus an empty info field.
-_ACCREDIT = bytes.fromhex("42030008") + b"general\x00" + bytes.fromhex("0000")
-
-# tcp/CallAll.json -> functionCode "66", ChildFunctionCode "7".
-_CALL_ALL = bytes.fromhex("4207")
-
-# tcp/Heartbeat.json -> functionCode "67" (=0x43), ChildFunctionCode "1", time.
-_HEARTBEAT = bytes.fromhex("4301")
-
-
-class DongleError(Exception):
-    """Protocol-level failure talking to the dongle."""
-
-
-@dataclass(frozen=True)
-class DongleInfo:
-    """Reply to ``BeforeAccredit``."""
-
-    version: int
-    factory: str
-    model: str
-    serial: str
-    time: int
-
-
-@dataclass(frozen=True)
-class Device:
-    """One entry of the ``AffiliatedDevice`` reply."""
-
-    factory: str
-    model: str
-    serial: str
-    protocol_identifier: str
-    device_type: str
-
-    @property
-    def modbus_id(self) -> int:
-        """Modbus slave address of the attached device.
-
-        The dongle itself owns address 0; devices behind it start at 1, which
-        matches the protocol document's "default Modbus address: 1".
-        """
-        return 1
-
-
-class DongleClient:
+class DongleClient(ClientCore):
     """Read-only session with one dongle."""
 
     def __init__(self, host: str, serial: str, *, port: int = DEFAULT_PORT,
                  slave: int = 1, timeout: float = 10.0,
                  interframe: float = 0.05) -> None:
-        self.host = host
-        self.port = port
-        self.slave = slave
-        self.timeout = timeout
-        self.interframe = interframe
-        self.keys: Keys = derive_keys(serial)
-        self.info: DongleInfo | None = None
+        super().__init__(host, serial, port=port, slave=slave,
+                         timeout=timeout, interframe=interframe)
         self._sock: socket.socket | None = None
-        self._tid = 0
         self._rx = bytearray()
 
     # -- lifecycle ------------------------------------------------------
@@ -129,40 +73,12 @@ class DongleClient:
                 self._sock = None
 
     # -- low level ------------------------------------------------------
-    def _next_tid(self) -> int:
-        tid = self._tid
-        self._tid = (self._tid + 1) & 0xFFFF
-        return tid
-
-    def _send(self, payload: bytes, *, protocol: int = 0,
-              tid: int | None = None) -> int:
+    def _send(self, payload: bytes, *, tid: int | None = None) -> int:
         if self._sock is None:
             raise DongleError("not connected")
-        if tid is None:
-            tid = self._next_tid()
-        # plaintext protocol id is 0x0000; _seal_frame patches byte 2 to 0x10
-        wire = self._seal_frame(wrap_payload(payload, tid, protocol))
+        tid, wire = self._seal(payload, tid=tid)
         self._sock.sendall(wire)
         return tid
-
-    def _seal_frame(self, plain: bytes) -> bytes:
-        """Replace the plaintext payload with the sealed envelope.
-
-        ``seal`` works on payloads, but the outer header must survive in
-        cleartext, so the frame is rebuilt by hand the way ``utils.a.m58``
-        does it: keep the 7-byte header, then append ``IV | CT | HMAC`` and
-        patch the protocol id and length field afterwards.
-        """
-        header, payload = plain[:7], plain[7:]
-        envelope = seal(payload, self.keys)
-        out = bytearray(header + envelope)
-        out[2] = (framing.PROTO_REQUEST >> 8) & 0xFF
-        out[4] = (len(envelope) + 1) >> 8
-        out[5] = (len(envelope) + 1) & 0xFF
-        return bytes(out)
-
-    def _open(self, frame: Frame) -> bytes:
-        return open_envelope(frame.envelope, self.keys)
 
     def _iter_frames(self) -> Iterator[Frame]:
         """Yield frames off the wire, transparently answering heartbeats."""
@@ -200,16 +116,13 @@ class DongleClient:
             payload = self._open(frame)
         except Exception:
             return
-        if len(payload) >= 2 and payload[0] == 0x43 and payload[1] == 0x01:
-            reply = _HEARTBEAT + struct.pack(">I", int(time.time()) & 0xFFFFFFFF)
-            plain = wrap_payload(reply, frame.tid, 0x1001)
-            wire = bytearray(self._seal_frame(plain))
-            wire[3] = 0x01  # protocol low byte, per WifiTcpService.m50
-            if self._sock is not None:
-                try:
-                    self._sock.sendall(bytes(wire))
-                except OSError:
-                    pass
+        if len(payload) < 2 or payload[:2] != CMD_HEARTBEAT:
+            return
+        if self._sock is not None:
+            try:
+                self._sock.sendall(self._heartbeat_frame(frame.tid))
+            except OSError:
+                pass
 
     # -- commands -------------------------------------------------------
     def _command(self, payload: bytes, expect_tids: int = 1) -> list[bytes]:
@@ -237,12 +150,12 @@ class DongleClient:
 
     def handshake(self) -> DongleInfo:
         """BeforeAccredit then Accredit; returns the dongle identity."""
-        reply = self._command(_BEFORE_ACCREDIT)
+        reply = self._command(CMD_BEFORE_ACCREDIT)
         if not reply:
             raise DongleError("the dongle ignored BeforeAccredit")
-        info = self._parse_dongle_info(reply[0])
+        info = parse_dongle_info(reply[0])
 
-        accredit = self._command(_ACCREDIT)
+        accredit = self._command(CMD_ACCREDIT)
         if not accredit:
             raise DongleError("the dongle ignored Accredit")
         result = accredit[0][2] if len(accredit[0]) > 2 else 1
@@ -250,39 +163,10 @@ class DongleClient:
             raise DongleError("Accredit refused with result 0x%02X" % result)
         return info
 
-    @staticmethod
-    def _parse_dongle_info(payload: bytes) -> DongleInfo:
-        if len(payload) < 8 or payload[0] != 0x42 or payload[1] != 0x02:
-            raise DongleError("unexpected BeforeAccredit reply: %s" % payload.hex())
-        # layout: 42 02 | version(4) | len(2)+factory | len(2)+model
-        #         | len(2)+serial | clock(4)
-        pos = 2
-        version = struct.unpack(">I", payload[pos:pos + 4])[0]
-        pos += 4
-
-        def text() -> str:
-            nonlocal pos
-            if pos + 2 > len(payload):
-                raise DongleError("truncated BeforeAccredit reply: %s"
-                                  % payload.hex())
-            length = struct.unpack(">H", payload[pos:pos + 2])[0]
-            pos += 2
-            if pos + length > len(payload):
-                raise DongleError("truncated BeforeAccredit reply: %s"
-                                  % payload.hex())
-            value = payload[pos:pos + length].decode("ascii", "replace").rstrip("\x00")
-            pos += length
-            return value
-
-        factory, model, serial = text(), text(), text()
-        clock = struct.unpack(">I", payload[pos:pos + 4])[0] if len(payload) >= pos + 4 else 0
-        return DongleInfo(version=version, factory=factory, model=model,
-                          serial=serial, time=clock)
-
     def call_all(self) -> list[dict[str, Any]]:
         """``CallAll``: the dongle pushes its info and attached device list."""
         out: list[dict[str, Any]] = []
-        for payload in self._command(_CALL_ALL):
+        for payload in self._command(CMD_CALL_ALL):
             js = payload.find(b"{")
             if js < 0:
                 continue
@@ -309,10 +193,8 @@ class DongleClient:
         return found
 
     def read(self, address: int, count: int, *, slave: int | None = None,
-             fc: int = framing.FC_READ_INPUT) -> tuple[int, ...]:
+             fc: int = FC_READ_INPUT) -> tuple[int, ...]:
         """Read *count* registers starting at *address*."""
-        if not 1 <= count <= framing.MAX_REGISTERS:
-            raise ValueError("count must be 1..%d" % framing.MAX_REGISTERS)
         target = self.slave if slave is None else slave
         payload = build_read(target, address, count, fc=fc)
         tid = self._send(payload)
@@ -324,9 +206,10 @@ class DongleClient:
                 raise DongleError("reply came from slave %d, expected %d"
                                   % (reply.slave, target))
             return reply.registers
-        raise DongleError("no reply for read at %d (slave %d)" % (address, target))
+        raise DongleError("no reply for read at %d (slave %d)"
+                          % (address, target))
 
-    def poll(self, *, slave: int | None = None, fc: int = framing.FC_READ_INPUT,
+    def poll(self, *, slave: int | None = None, fc: int = FC_READ_INPUT,
              on_error: str = "skip") -> dict[str, Any]:
         """Read every documented read-only register and decode it.
 
@@ -347,23 +230,9 @@ class DongleClient:
             try:
                 values = self.read(start, count, slave=target, fc=fc)
             except (ModbusError, DongleNoDataError) as exc:
-                if on_error == "raise":
-                    raise
-                failures.append({"range": "%d~%d" % (start, end),
-                                 "error": str(exc)})
+                self._note_failure(failures, start, end, exc, on_error)
                 continue
             for offset, value in enumerate(values):
                 words[start + offset] = value
 
-        result: dict[str, Any] = {}
-        for reg in REGISTERS:
-            got = tuple(words.get(a) for a in range(reg.address, reg.end + 1))
-            if any(word is None for word in got):
-                result[reg.key] = {"address": reg.span, "name": reg.name,
-                                   "section": reg.section, "error": "unavailable"}
-                continue
-            result[reg.key] = decode(reg, tuple(got))  # type: ignore[arg-type]
-
-        if failures:
-            result["_unreadable_ranges"] = failures
-        return result
+        return self._assemble(words, failures)

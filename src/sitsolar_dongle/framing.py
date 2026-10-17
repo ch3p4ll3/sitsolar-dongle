@@ -126,7 +126,7 @@ def wrap_payload(payload: bytes, tid: int, protocol: int = 0) -> bytes:
 
     The plaintext protocol id is ``0x0000``; the official app patches header
     byte 2 to ``0x10`` (making ``0x1000``) only *after* encrypting, which is
-    what :meth:`DongleClient._seal_frame` does too.
+    what :func:`~sitsolar_dongle.session.seal_frame` reproduces.
     """
     body = payload
     return struct.pack(">HHHB", tid, protocol, len(body) + 1, 0) + body

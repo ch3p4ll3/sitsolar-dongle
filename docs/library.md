@@ -10,8 +10,13 @@ The CLI is a thin wrapper. Everything it does is available as a library, from a
 single import:
 
 ```python
-from sitsolar_dongle import DongleClient
+from sitsolar_dongle import DongleClient          # blocking
+from sitsolar_dongle import AsyncDongleClient     # asyncio
 ```
+
+Both share the same protocol core, register map and exceptions — pick the
+[blocking client](#dongleclient) for scripts and the
+[async client](#asyncdongleclient) for event loops such as Home Assistant.
 
 Only reads are implemented; nothing in this package ever writes to the
 inverter.
@@ -139,6 +144,117 @@ Each reading carries `address`, `name`, `section`, `raw`, and — depending on t
 data type — `value`, `unit`, `label`, `active_bits`, and `raw_signed`. The
 full field list is in the [CLI reference](cli.md#json-shape), since the shape is
 identical.
+
+---
+
+## `AsyncDongleClient`
+
+The same session, spoken with `asyncio`. Use this from Home Assistant, FastAPI
+or any long-running service — `DongleClient` blocks the event loop it is called
+from.
+
+```python
+from sitsolar_dongle import AsyncDongleClient
+
+async with AsyncDongleClient("192.168.1.50", "<DONGLE_SERIAL>") as dongle:
+    values = await dongle.poll()
+```
+
+The constructor takes the same parameters as [`DongleClient`](#dongleclient).
+Every method that touches the wire is a coroutine; the returned values,
+exceptions and `poll()` shape are identical.
+
+| | Blocking | Async |
+|---|---|---|
+| Open | `connect()` | `await connect()` |
+| Close | `close()` | `await close()` |
+| Identity | `dongle.info` | `dongle.info` |
+| Raw read | `dongle.read(31002, 2)` | `await dongle.read(31002, 2)` |
+| Full poll | `dongle.poll()` | `await dongle.poll()` |
+| Devices | `dongle.devices()` | `await dongle.devices()` |
+
+### `connected -> bool`
+
+True while there is a live connection to the dongle.
+
+### How it differs from the blocking client
+
+!!!info Built for an event loop
+Nothing blocks: there is no `socket`, `time.sleep` or synchronous `recv`
+anywhere in the module.
+
+Concurrent callers are serialised by an `asyncio.Lock`, so two tasks awaiting
+`poll()` and `read()` on the same client never interleave frames on the wire.
+
+Every read is bounded by `timeout`.
+!!!
+
+!!!warning A failed connection closes itself
+A connection that times out, or is closed mid-frame, is closed by the client
+rather than left half-read — a partially consumed frame could never be
+trusted for the next request. Call `await connect()` to reopen.
+!!!
+
+!!!success One client per dongle
+The lock serialises requests *within* a client. To poll several dongles,
+create one `AsyncDongleClient` per device: nothing is shared globally, so they
+all run concurrently.
+!!!
+
+### Using it from Home Assistant
+
+`AsyncDongleClient` deliberately carries no `homeassistant` dependency, so this
+library never pins you to one HA release. Wire it into an integration with a
+`DataUpdateCoordinator`:
+
+```python
+from datetime import timedelta
+import logging
+
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from sitsolar_dongle import AsyncDongleClient, DongleError
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    dongle = AsyncDongleClient(entry.data["host"], entry.data["serial"],
+                               timeout=10.0)
+
+    async def async_update():
+        try:
+            if not dongle.connected:
+                await dongle.connect()
+            return await dongle.poll()
+        except DongleError as exc:
+            await dongle.close()      # drop the broken connection
+            raise UpdateFailed(str(exc)) from exc
+
+    coordinator = DataUpdateCoordinator(
+        hass, _LOGGER,
+        name="sitsolar",
+        update_method=async_update,
+        update_interval=timedelta(seconds=15),
+    )
+    await coordinator.async_config_entry_first_refresh()
+    async_add_entities(
+        SolarSensor(coordinator, key) for key in coordinator.data
+        if "value" in coordinator.data[key]
+    )
+```
+
+!!!success Why close on failure
+`connect()` reopens cleanly, but a stale connection is silently useless.
+Closing when the refresh fails makes the next attempt start from a fresh
+handshake, and the coordinator marks the entities unavailable in between.
+!!!
+
+!!!warning Do not block the coordinator
+`poll()` reads 34 ranges in sequence and takes on the order of a second on
+real hardware. That is fine for a 15-second `update_interval`, but avoid
+calling it from a hot path such as a state-change callback.
+!!!
 
 ---
 

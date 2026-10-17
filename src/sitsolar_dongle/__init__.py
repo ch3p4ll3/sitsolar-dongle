@@ -15,12 +15,22 @@ Typical use::
             if "value" in reading:
                 print(key, reading["value"], reading.get("unit", ""))
 
+For asyncio applications such as Home Assistant, use
+:class:`AsyncDongleClient` instead -- :class:`DongleClient` blocks the event
+loop it is called from::
+
+    from sitsolar_dongle import AsyncDongleClient
+
+    async with AsyncDongleClient("192.168.1.50", "300018101261010226") as dongle:
+        values = await dongle.poll()
+
 Only reads are implemented; nothing in this package ever writes to the
 inverter.
 """
 
 from __future__ import annotations
 
+from .async_client import AsyncDongleClient
 from .client import DEFAULT_PORT, Device, DongleClient, DongleError, DongleInfo
 from .crc import crc16, crc16_bytes
 from .crypto import EnvelopeError, Keys, derive_keys, open_envelope, seal
@@ -29,9 +39,10 @@ from .framing import (MAX_REGISTERS, HEADER, DongleNoDataError, Frame,
                       ModbusError, build_read, parse_read_reply, wrap_payload)
 from .registers import REGISTERS, Register, blocks
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
+    "AsyncDongleClient",
     "DEFAULT_PORT",
     "Device",
     "DongleClient",

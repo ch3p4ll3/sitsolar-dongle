@@ -1,0 +1,377 @@
+"""Tests for :class:`sitsolar_dongle.async_client.AsyncDongleClient`.
+
+The client is exercised end to end against an in-process fake dongle that
+speaks the real protocol: it derives the same keys, parses the encrypted
+frames the client sends, and answers ``BeforeAccredit``/``Accredit``/
+``CallAll``/FC reads the way the hardware does.  Everything runs through
+``asyncio.run`` so no plugin is required.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import struct
+
+import pytest
+
+from sitsolar_dongle import AsyncDongleClient, DongleError
+from sitsolar_dongle.crc import crc16_bytes
+from sitsolar_dongle.crypto import EnvelopeError, derive_keys, open_envelope
+from sitsolar_dongle.framing import HEADER, PROTO_PUSH, parse_header
+from sitsolar_dongle.session import (
+    CMD_ACCREDIT,
+    CMD_BEFORE_ACCREDIT,
+    CMD_CALL_ALL,
+    CMD_HEARTBEAT,
+    seal_frame,
+)
+
+SERIAL = "300018101261010226"
+
+
+def first_block_start() -> int:
+    """Address of the first range ``poll()`` asks for."""
+    from sitsolar_dongle.registers import blocks
+
+    return next(iter(blocks()))[0]
+
+
+async def wait_until(predicate, timeout: float = 2.0) -> None:
+    """Let the fake dongle's task catch up before asserting on it."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("timed out waiting for the dongle")
+        await asyncio.sleep(0.01)
+
+
+class FakeDongle:
+    """A scripted dongle: real crypto, canned replies."""
+
+    def __init__(self, serial: str = SERIAL, *, registers: dict[int, int] | None = None,
+                 refuse: set[int] | None = None, push_before_read: bool = False,
+                 host: str = "127.0.0.1") -> None:
+        self.serial = serial
+        self.keys = derive_keys(serial)
+        self.registers = registers or {}
+        self.refuse = refuse or set()
+        self.push_before_read = push_before_read
+        self.host = host
+        self.port = 0
+        self.heartbeats = 0
+        self.pushed = False
+        self.requests: list[bytes] = []
+        self._server: asyncio.Server | None = None
+
+    async def __aenter__(self) -> FakeDongle:
+        self._server = await asyncio.start_server(self._handle, self.host, 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        assert self._server is not None
+        self._server.close()
+        await self._server.wait_closed()
+
+    # -- protocol ------------------------------------------------------
+    async def _handle(self, reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                header = await reader.readexactly(7)
+                tid, _protocol, length, _unit = parse_header(header)
+                payload = open_envelope(await reader.readexactly(length - 1),
+                                        self.keys)
+                self.requests.append(payload)
+
+                if payload[:2] == CMD_HEARTBEAT:
+                    # the dongle never answers its own heartbeat
+                    self.heartbeats += 1
+                    continue
+
+                if (self.push_before_read and payload[:6] == HEADER
+                        and not self.pushed):
+                    self.pushed = True
+                    push = CMD_HEARTBEAT + struct.pack(">I", 1700000000)
+                    writer.write(seal_frame(push, self.keys, tid=0x4242,
+                                            protocol=PROTO_PUSH))
+                    await writer.drain()
+
+                reply = self._reply_for(payload)
+                if reply is None:
+                    continue
+                writer.write(seal_frame(reply, self.keys, tid=tid))
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError, EnvelopeError):
+            pass
+        finally:
+            writer.close()
+
+    def _reply_for(self, payload: bytes) -> bytes | None:
+        if payload[:2] == CMD_BEFORE_ACCREDIT[:2]:
+            return self._info_payload()
+        if payload[:2] == CMD_ACCREDIT[:2]:
+            return bytes.fromhex("42030000")     # result 0 = accepted
+        if payload[:2] == CMD_CALL_ALL:
+            return CMD_CALL_ALL + (b'{"devInfo":{"factory":"SiNeng",'
+                                   b'"model":"3K-HS","sn":"%s",'
+                                   b'"protocolIdentifier":"",'
+                                   b'"devType":"33"}}' % self.serial.encode())
+        if payload[:6] == HEADER:
+            return self._read_reply(payload)
+        return None
+
+    def _info_payload(self) -> bytes:
+        out = bytearray(bytes.fromhex("4202") + struct.pack(">I", 1))
+        for text in (b"SiNeng", b"Si-Dongle-L", self.serial.encode()):
+            out += struct.pack(">H", len(text)) + text
+        out += struct.pack(">I", 1700000000)
+        return bytes(out)
+
+    def _read_reply(self, payload: bytes) -> bytes:
+        slave, fc = payload[6], payload[7]
+        address, count = struct.unpack(">HH", payload[8:12])
+
+        if address in self.refuse:
+            # the bare 64 07 <status> stub: nothing behind the prefix
+            return bytes([0x64, 0x07, 0x01])
+
+        body = bytes([slave, fc, count * 2])
+        for offset in range(count):
+            body += struct.pack(
+                ">H", self.registers.get(address + offset, 0) & 0xFFFF)
+        return bytes([0x64, 0x07, 0x00]) + body + crc16_bytes(body)
+
+
+# -- lifecycle -----------------------------------------------------------
+
+def test_handshake_populates_info() -> None:
+    async def main() -> None:
+        async with FakeDongle() as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                assert client.connected
+                assert client.info is not None
+                assert client.info.model == "Si-Dongle-L"
+                assert client.info.serial == SERIAL
+                assert client.info.factory == "SiNeng"
+                assert client.info.time == 1700000000
+            assert not client.connected
+
+    asyncio.run(main())
+
+
+def test_connect_returns_info_and_is_reentrant() -> None:
+    async def main() -> None:
+        async with FakeDongle() as dongle:
+            client = AsyncDongleClient(dongle.host, SERIAL, port=dongle.port)
+            first = await client.connect()
+            assert first.serial == SERIAL
+            # a second connect() must close the first connection first
+            second = await client.connect()
+            assert second == first
+            await client.close()
+
+    asyncio.run(main())
+
+
+def test_operations_before_connect_fail_cleanly() -> None:
+    async def main() -> None:
+        client = AsyncDongleClient("127.0.0.1", SERIAL, port=9)
+        assert not client.connected
+        with pytest.raises(DongleError, match="not connected"):
+            await client.read(31002, 2)
+        with pytest.raises(DongleError, match="not connected"):
+            await client.handshake()
+
+    asyncio.run(main())
+
+
+# -- reading -------------------------------------------------------------
+
+def test_read_returns_registers() -> None:
+    async def main() -> None:
+        registers = {31002: 0, 31003: 50020}
+        async with FakeDongle(registers=registers) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                assert await client.read(31002, 2) == (0, 50020)
+                assert await client.read(31002, 1) == (0,)
+
+    asyncio.run(main())
+
+
+def test_poll_decodes_the_whole_map() -> None:
+    async def main() -> None:
+        registers = {31003: 50020}
+        async with FakeDongle(registers=registers) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                values = await client.poll()
+                assert values["grid_frequency"]["value"] == 50.02
+                assert values["grid_frequency"]["unit"] == "Hz"
+                assert "_unreadable_ranges" not in values
+                assert len(values) == 183
+
+    asyncio.run(main())
+
+
+def test_poll_records_refused_ranges() -> None:
+    async def main() -> None:
+        # refuse the first address of the first read block
+        first = first_block_start()
+        async with FakeDongle(refuse={first}) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                values = await client.poll()
+                failures = values["_unreadable_ranges"]
+                assert len(failures) == 1
+                assert failures[0]["range"].startswith(str(first))
+                assert "stub" in failures[0]["error"]
+
+    asyncio.run(main())
+
+
+def test_poll_on_error_raise_propagates() -> None:
+    async def main() -> None:
+        from sitsolar_dongle.framing import DongleNoDataError
+
+        async with FakeDongle(refuse={first_block_start()}) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                with pytest.raises(DongleNoDataError):
+                    await client.poll(on_error="raise")
+
+    asyncio.run(main())
+
+
+def test_devices_parses_call_all() -> None:
+    async def main() -> None:
+        async with FakeDongle() as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                found = await client.devices()
+                assert len(found) == 1
+                assert found[0].model == "3K-HS"
+                assert found[0].device_type == "33"
+                assert found[0].modbus_id == 1
+
+    asyncio.run(main())
+
+
+# -- pushes and failures -------------------------------------------------
+
+def test_heartbeat_push_is_answered() -> None:
+    async def main() -> None:
+        async with FakeDongle(push_before_read=True) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                # the push rides ahead of the reply; the read still succeeds
+                assert await client.read(31002, 2) == (0, 0)
+            # the server task needs a beat to read the heartbeat reply
+            await wait_until(lambda: dongle.heartbeats == 1)
+
+    asyncio.run(main())
+
+
+def test_wrong_serial_fails_and_closes() -> None:
+    async def main() -> None:
+        async with FakeDongle() as dongle:
+            client = AsyncDongleClient(dongle.host,
+                                       "300018101261010227",
+                                       port=dongle.port, timeout=1.0)
+            with pytest.raises(DongleError, match="closed by the dongle"):
+                await client.connect()
+            assert not client.connected
+
+    asyncio.run(main())
+
+
+def test_timeout_closes_the_connection() -> None:
+    """A silent server must time out and leave the client disconnected."""
+
+    async def silent(reader: asyncio.StreamReader,
+                     writer: asyncio.StreamWriter) -> None:
+        try:
+            while await reader.read(4096):
+                pass
+        except ConnectionError:
+            pass
+        finally:
+            writer.close()
+
+    async def main() -> None:
+        server = await asyncio.start_server(silent, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            client = AsyncDongleClient("127.0.0.1", SERIAL, port=port,
+                                       timeout=0.2)
+            with pytest.raises(DongleError, match="timed out|no data"):
+                await client.connect()
+            # the half-open connection is dropped rather than left desynced
+            assert not client.connected
+            await client.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(main())
+
+
+def test_concurrent_reads_are_serialised() -> None:
+    """Two callers must not interleave request/reply on one connection."""
+
+    async def main() -> None:
+        registers = {31002: 1111, 31003: 2222, 31004: 3333, 31005: 4444}
+        async with FakeDongle(registers=registers) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                first, second = await asyncio.gather(
+                    client.read(31002, 2),
+                    client.read(31004, 2),
+                )
+                assert first == (1111, 2222)
+                assert second == (3333, 4444)
+
+    asyncio.run(main())
+
+
+def test_seal_frame_sets_both_protocol_bytes() -> None:
+    """The shared sealer must reproduce the app's header patching exactly."""
+    from sitsolar_dongle.session import PROTO_HEARTBEAT_REPLY
+
+    keys = derive_keys(SERIAL)
+    wire = seal_frame(b"\x42\x02", keys, tid=7)
+    tid, protocol, length, unit = parse_header(wire[:7])
+    assert tid == 7
+    assert protocol == 0x1000          # requests
+    assert unit == 0
+    assert length == (len(wire) - 6)
+
+    beat = seal_frame(CMD_HEARTBEAT, keys, tid=7,
+                      protocol=PROTO_HEARTBEAT_REPLY)
+    assert parse_header(beat[:7])[1] == 0x1001   # heartbeat replies
+
+
+def test_seal_frame_header_matches_the_app_patch() -> None:
+    """Pin the outer header the vendor app produces by patching after encrypt.
+
+    The app builds the plaintext with protocol ``0x0000``, encrypts, then
+    patches byte 2 to ``0x10`` and rewrites the length.  The shared sealer
+    writes both protocol bytes up front, so these are the bytes that must
+    stay put for the dongle to accept a frame.
+    """
+    keys = derive_keys(SERIAL)
+    wire = seal_frame(CMD_BEFORE_ACCREDIT, keys, tid=0x1234)
+    envelope = wire[7:]
+
+    assert wire[:2] == (0x1234).to_bytes(2, "big")       # tid
+    assert wire[2:4] == bytes([0x10, 0x00])              # protocol 0x1000
+    assert wire[6] == 0x00                               # unit
+    # length counts the unit byte plus everything after the header
+    assert wire[4:6] == (len(envelope) + 1).to_bytes(2, "big")
+    # the length field must agree with the actual frame size on the wire
+    assert parse_header(wire[:7])[2] == len(wire) - 6
+    # and the payload survives the round trip
+    assert open_envelope(envelope, keys) == CMD_BEFORE_ACCREDIT
