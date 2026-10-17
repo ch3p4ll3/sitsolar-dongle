@@ -1,0 +1,126 @@
+name: Publish to PyPI
+
+# Publishes sitsolar-dongle to PyPI whenever a GitHub Release is published.
+#
+# Uses PyPA Trusted Publishing (OIDC), so no API token or long-lived secret is
+# stored in the repository.
+#
+# One-time setup on pypi.org:
+#   Project -> Manage -> Publishing -> Add a new publisher
+#     Owner:      ch3p4ll3
+#     Repository: sitsolar-dongle-reader
+#     Workflow:   publish-pypi.yml
+#     Environment: pypi      <- must match `environment.name` below
+#
+# Releasing:
+#   1. Bump __version__ in src/sitsolar_dongle/__init__.py (single source).
+#   2. Commit, then create a GitHub Release tagged vX.Y.Z matching that version.
+#   3. The build job fails if the tag and the built version disagree.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Never let two publishes of the same project race.
+concurrency:
+  group: pypi-publish
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  build:
+    name: Build distributions
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Validate metadata
+        run: twine check --strict dist/*
+
+      # Guards against tagging v0.2.0 while __version__ still says 0.1.0,
+      # which would otherwise publish a mismatched release.
+      - name: Verify tag matches the built version
+        run: |
+          WANT="${GITHUB_REF_NAME#v}"
+          GOT="$(basename dist/*.whl | cut -d- -f2)"
+          echo "release tag : ${GITHUB_REF_NAME} (expected version ${WANT})"
+          echo "built wheel : $(basename dist/*.whl) (version ${GOT})"
+          if [ "$WANT" != "$GOT" ]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' does not match built version '${GOT}'. Bump __version__ in src/sitsolar_dongle/__init__.py."
+            exit 1
+          fi
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # The environment name must match the one configured on pypi.org.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/sitsolar-dongle
+    permissions:
+      # OIDC token for Trusted Publishing, plus attestations for the
+      # signed provenance PyPI now displays alongside releases.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          # Fail loudly rather than silently skipping a bad upload.
+          print-hash: true

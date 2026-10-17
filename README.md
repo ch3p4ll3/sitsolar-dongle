@@ -36,13 +36,23 @@ retype start
 
 ## Install
 
-From the root of this repository:
+From [PyPI](https://pypi.org/project/sitsolar-dongle/):
+
+```bash
+pip install sitsolar-dongle
+```
+
+Or from the root of this repository:
 
 ```bash
 uv venv && uv sync
 ```
 
 Requires Python 3.10+ and `pycryptodome`.
+
+New versions are published to PyPI automatically whenever a GitHub Release is
+published — see [Development](https://ch3p4ll3.github.io/sitsolar-dongle-reader/development/)
+for the release process.
 
 ## Quick start
 

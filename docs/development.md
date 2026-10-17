@@ -209,6 +209,130 @@ to `main`.
 
 ---
 
+## Packaging
+
+The project ships to PyPI as **[`sitsolar-dongle`](https://pypi.org/project/sitsolar-dongle/)**,
+built with [hatchling](https://hatch.pypa.io/) from `pyproject.toml`.
+
+| | |
+|---|---|
+| Distribution name | `sitsolar-dongle` |
+| Import package | `sitsolar_dongle` |
+| Console script | `sitsolar-dongle` → `sitsolar_dongle.cli:main` |
+| Build backend | `hatchling>=1.27` |
+| Python | `>=3.10` |
+
+!!!info "The version is single-sourced"
+`[project] dynamic = ["version"]` plus `[tool.hatch.version]` tells hatchling to
+read the version from `__version__` in
+[`src/sitsolar_dongle/__init__.py`](https://github.com/ch3p4ll3/sitsolar-dongle-reader/blob/main/src/sitsolar_dongle/__init__.py).
+There is **one** place to bump it, and the CLI's `--version` output stays in
+step automatically.
+!!!
+
+The metadata uses a **PEP 639** SPDX license expression
+(`license = "GPL-3.0-or-later"` with `license-files = ["LICENSE"]`). Because of
+that, the `License ::` trove classifiers are deliberately **omitted** — PyPI
+rejects a distribution that carries both.
+
+### Build and verify locally
+
+```bash
+python -m build          # or: uv build
+twine check --strict dist/*
+```
+
+Then install the wheel into a scratch environment and smoke-test it:
+
+```bash
+python -m venv /tmp/smoke && /tmp/smoke/bin/pip install dist/*.whl
+/tmp/smoke/bin/python -c "import sitsolar_dongle; print(sitsolar_dongle.__version__)"
+/tmp/smoke/bin/sitsolar-dongle --version
+/tmp/smoke/bin/sitsolar-dongle --list
+```
+
+---
+
+## Continuous deployment to PyPI
+
+Publishing is handled by
+[`.github/workflows/publish-pypi.yml`](https://github.com/ch3p4ll3/sitsolar-dongle-reader/blob/main/.github/workflows/publish-pypi.yml)
+and is triggered by a **published GitHub Release**. It runs three jobs:
+
+>>> 1. Test
+
+    The suite runs across Python 3.10–3.14.
+
+>>> 2. Build
+
+    `python -m build` produces the sdist and wheel, `twine check --strict`
+    validates the metadata, and a guard fails the job if the release tag does
+    not match the built version.
+
+>>> 3. Publish
+
+    `pypa/gh-action-pypi-publish` uploads to PyPI over OIDC.
+
+>>
+
+A separate [CI workflow](https://github.com/ch3p4ll3/sitsolar-dongle-reader/blob/main/.github/workflows/ci.yml)
+runs the same tests plus a build check on every push to `main` and every pull
+request, so a release is the last gate rather than the first time anything runs.
+
+### Trusted Publishing
+
+The workflow authenticates with **PyPA Trusted Publishing** (OIDC). No API token
+is stored in the repository, and there is no long-lived credential to rotate or
+leak.
+
+!!!success One-time setup on pypi.org
+On the project page: **Manage → Publishing → Add a new publisher**
+
+| Field | Value |
+|---|---|
+| Owner | `ch3p4ll3` |
+| Repository | `sitsolar-dongle-reader` |
+| Workflow name | `publish-pypi.yml` |
+| Environment name | `pypi` |
+
+The environment name **must** match the `environment: name: pypi` block in the
+workflow, or the OIDC token will be rejected.
+!!!
+
+### Cutting a release
+
+>>> 1. Bump the version
+
+    Edit `__version__` in `src/sitsolar_dongle/__init__.py` — the single source
+    of truth.
+
+>>> 2. Commit
+
+    Push the bump to `main` and let CI go green.
+
+>>> 3. Tag and publish a Release
+
+    Create a GitHub Release whose tag is `vX.Y.Z`, matching the version exactly.
+    Publishing the Release triggers the workflow.
+
+>>>
+
+!!!warning "The tag must match the version"
+If you tag `v0.2.0` while `__version__` still reads `0.1.0`, the build job fails
+with an explicit error rather than publishing a mismatched release. PyPI also
+refuses to accept the same version twice, so every release needs a fresh bump.
+!!!
+
+### Workflow summary
+
+| Workflow | Trigger | Purpose |
+|---|---|---|
+| `ci.yml` | Push to `main`, pull requests | Tests across 3.10–3.14, build + metadata validation. |
+| `docs.yml` | Push to `main` touching docs | Builds and deploys this site to GitHub Pages. |
+| `publish-pypi.yml` | GitHub Release published | Tests, builds, version-gates, and publishes to PyPI. |
+
+---
+
 ## License
 
 GNU General Public License v3.0 — see [License](license.md).

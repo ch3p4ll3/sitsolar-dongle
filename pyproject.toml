@@ -1,22 +1,102 @@
 [project]
 name = "sitsolar-dongle"
-version = "0.1.0"
 description = "Read-only Modbus polling client for the SiNeng / FuturaPulse WiFi dongle (TCP port 7078)"
 readme = "README.md"
+
+# PEP 639: an SPDX license expression plus the license file itself.
+# Note: with an SPDX expression, `License ::` trove classifiers must NOT be
+# added -- PyPI rejects the combination.
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+
 requires-python = ">=3.10"
+keywords = [
+    "modbus",
+    "sineng",
+    "futurapulse",
+    "sit-solar",
+    "inverter",
+    "solar",
+    "photovoltaic",
+    "pv",
+    "dongle",
+    "telemetry",
+    "energy",
+    "homeassistant",
+]
+
+authors = [
+    { name = "sitsolar-dongle-reader contributors" },
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Communications",
+    "Topic :: Home Automation",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+    "Topic :: Utilities",
+]
+
 dependencies = [
     "pycryptodome>=3.19",
 ]
+
+# Single-sourced from src/sitsolar_dongle/__init__.py via [tool.hatch.version].
+# Bump it there, then tag the release to match.
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/ch3p4ll3/sitsolar-dongle-reader"
+Repository = "https://github.com/ch3p4ll3/sitsolar-dongle-reader"
+Documentation = "https://ch3p4ll3.github.io/sitsolar-dongle-reader/"
+Issues = "https://github.com/ch3p4ll3/sitsolar-dongle-reader/issues"
+Changelog = "https://github.com/ch3p4ll3/sitsolar-dongle-reader/releases"
 
 [project.scripts]
 sitsolar-dongle = "sitsolar_dongle.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "build>=1.2",
+    "twine>=5",
+]
 
 [build-system]
-requires = ["hatchling"]
+# hatchling >= 1.27 is required for PEP 639 (SPDX license + license-files).
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
+
+# The version is read from __version__ in this file.
+[tool.hatch.version]
+path = "src/sitsolar_dongle/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sitsolar_dongle"]
+
+[tool.hatch.build.targets.sdist]
+# Keep the sdist focused: source, tests, and the legal/readme files.
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
