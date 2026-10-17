@@ -1,0 +1,68 @@
+name: Build and deploy documentation
+
+# Builds the Retype site from docs/ and publishes it to GitHub Pages.
+#
+# One-time repository setup (Settings -> Pages -> Build and deployment):
+#     Source: GitHub Actions
+#
+# The site is then published to
+#     https://ch3p4ll3.github.io/sitsolar-dongle-reader/
+# on every push to main that touches the documentation.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "retype.yml"
+      - ".github/workflows/docs.yml"
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch:
+
+# Least privilege by default; the deploy job adds what Pages needs.
+permissions:
+  contents: read
+
+# Never let two deployments race: queue them, and do not cancel a live deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Retype site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          # Full history so Retype can render the "last updated" footer
+          # from Git commit metadata (see lastUpdated in retype.yml).
+          fetch-depth: 0
+
+      # Retype is free for projects under 100 pages, so no key is required
+      # here. If the project ever outgrows the free tier, add a RETYPE_KEY
+      # repository secret and it will be picked up automatically.
+      - name: Build with Retype
+        uses: retypeapp/action-build@v4
+        env:
+          RETYPE_KEY: ${{ secrets.RETYPE_KEY }}
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          # The output directory configured in retype.yml.
+          path: .retype
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    # Grants the deployment environment and records the final URL in the run.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

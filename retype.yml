@@ -1,0 +1,67 @@
+# Retype project configuration
+# https://retype.com/configuration/project/
+#
+# Local preview:  retype start
+# Build:          retype build   (output goes to .retype/, gitignored)
+
+input: docs
+output: .retype
+
+# Canonical address of the published site (GitHub Pages project site).
+# `cname: false` keeps Retype from writing a CNAME file, which would break a
+# *.github.io project site.
+url: https://ch3p4ll3.github.io/sitsolar-dongle-reader
+cname: false
+
+generator:
+  paths: relative
+  trailingSlash: true
+
+branding:
+  title: sitsolar-dongle
+  label: Docs
+
+meta:
+  description: Read-only Modbus client for the SiNeng / FuturaPulse WiFi dongle
+    that ships with Sit Solar inverters.
+  author: sitsolar-dongle-reader contributors
+  keywords:
+    - modbus
+    - siNeng
+    - FuturaPulse
+    - Sit Solar
+    - inverter
+    - photovoltaic
+    - solar
+    - dongle
+    - home assistant
+
+# "Edit this page" links back to the docs/ sources on GitHub.
+edit:
+  repo: https://github.com/ch3p4ll3/sitsolar-dongle-reader
+  base: /docs
+  branch: main
+
+# Needs `fetch-depth: 0` on the checkout step to have Git history available.
+lastUpdated:
+  date:
+    enabled: true
+    source: committer
+
+links:
+  - text: GitHub
+    link: https://github.com/ch3p4ll3/sitsolar-dongle-reader
+    icon: mark-github
+    target: blank
+    title: Source repository
+  - text: Report an issue
+    link: https://github.com/ch3p4ll3/sitsolar-dongle-reader/issues
+    icon: issue-opened
+    target: blank
+
+footer:
+  copyright: "&copy; {{ year }} sitsolar-dongle-reader contributors. Released under the GPL-3.0 license."
+  links:
+    - text: License
+      link: license.md
+      title: View the software license agreement

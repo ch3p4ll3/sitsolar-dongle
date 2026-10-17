@@ -14,6 +14,26 @@ Nothing in this package ever writes to the inverter — only FC 0x04 / 0x03 read
 > Android app and its published Modbus protocol document. Use it at your own
 > risk, on your own equipment.
 
+## Documentation
+
+Full documentation is published at
+**<https://ch3p4ll3.github.io/sitsolar-dongle-reader/>** — it covers the
+[install walkthrough](https://ch3p4ll3.github.io/sitsolar-dongle-reader/getting-started/),
+the [CLI](https://ch3p4ll3.github.io/sitsolar-dongle-reader/cli/) and
+[Python API](https://ch3p4ll3.github.io/sitsolar-dongle-reader/library/)
+references, the [wire protocol](https://ch3p4ll3.github.io/sitsolar-dongle-reader/protocol/),
+and the [complete register map](https://ch3p4ll3.github.io/sitsolar-dongle-reader/protocol/registers/)
+with known hardware quirks.
+
+The site is built from [`docs/`](docs/) with [Retype](https://retype.com) and
+deployed to GitHub Pages automatically by GitHub Actions on every push to
+`main`. To preview it locally:
+
+```bash
+npm install --global retypeapp
+retype start
+```
+
 ## Install
 
 From the root of this repository:

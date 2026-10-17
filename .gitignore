@@ -1,2 +1,5 @@
 .venv/
 __pycache__/
+.retype/
+retype.manifest
+node_modules/
