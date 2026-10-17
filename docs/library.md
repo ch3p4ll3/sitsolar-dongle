@@ -272,10 +272,15 @@ async def async_setup_entry(hass, entry, async_add_entities):
     state = {"retry_after": 0.0}
 
     async def async_update():
+        # A lockout that is still running is not a failure.  This guard sits
+        # *outside* the try on purpose: if it were inside, the finally below
+        # would push `retry_after` forward on every tick and the backoff
+        # would never expire, leaving the entities unavailable for good.
+        if not dongle.connected and time.monotonic() < state["retry_after"]:
+            raise UpdateFailed("waiting out the reconnect lockout")
+
         try:
             if not dongle.connected:
-                if time.monotonic() < state["retry_after"]:
-                    raise UpdateFailed("waiting out the reconnect lockout")
                 await dongle.connect()
             return await dongle.poll()
         except DongleError as exc:
@@ -287,6 +292,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
             # not called above -- an EnvelopeError or a ModbusError raised
             # under on_error="raise" leaves a healthy socket that is worth
             # keeping, and `connected` stays True so no backoff is set.
+            # Only genuine attempts reach this point, so every set of
+            # `retry_after` here marks a real failure.
             if not dongle.connected:
                 state["retry_after"] = time.monotonic() + RECONNECT_AFTER
 
@@ -322,7 +329,13 @@ naive 15-second retry loop spends its whole life being refused. The
 reporting the entities unavailable instead of opening a connection the
 dongle will reject anyway.
 
-Note what that costs. If the lockout really does follow *any* dropped
+The guard has to sit outside the `try`. If it is inside, every tick spent
+waiting raises `UpdateFailed` *and* runs the `finally`, which pushes the
+deadline another 75 s into the future each time — so a failure at startup
+would leave the integration unavailable until Home Assistant is reloaded.
+Outside, only a genuine attempt can move the deadline.
+
+Note what the backoff costs. If the lockout really does follow *any* dropped
 connection, then a single transient failure pins the entities unavailable for
 75 s. That is the safe assumption to make — but see the caveats for what is
 and is not actually known about the trigger.
