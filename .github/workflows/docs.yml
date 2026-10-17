@@ -59,6 +59,12 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    # `deploy-pages` authenticates with an OIDC token, so this job needs
+    # `id-token: write` on top of `pages: write`. Without them the runner has
+    # no ACTIONS_ID_TOKEN_REQUEST_URL and the deploy fails.
+    permissions:
+      pages: write
+      id-token: write
     # Grants the deployment environment and records the final URL in the run.
     environment:
       name: github-pages
