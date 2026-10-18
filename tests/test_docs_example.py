@@ -5,6 +5,12 @@ Mirroring that logic here would let the two drift, so this pulls the code
 block straight out of the markdown, compiles it, and drives it against a fake
 clock and a stub client.  If the documented example stops reconnecting, this
 test fails.
+
+Skipped when ``docs/`` is absent, because the sdist deliberately ships
+``tests/`` without the documentation (see ``[tool.hatch.build.targets.sdist]``
+in ``pyproject.toml``).  Anyone running the suite from an unpacked tarball --
+distro packagers, typically -- therefore gets a skip here rather than four
+failures for a file that was never included.  CI and checkouts have the file.
 """
 
 from __future__ import annotations
@@ -23,6 +29,13 @@ from sitsolar_dongle import DongleError
 DOCS = Path(__file__).resolve().parents[1] / "docs" / "library.md"
 HEADING = "### Using it from Home Assistant"
 TICK = 15.0
+
+if not DOCS.exists():
+    pytest.skip(
+        f"{DOCS.name} is not shipped in the sdist, so there is no example to "
+        "extract -- run this suite from a checkout",
+        allow_module_level=True,
+    )
 
 
 def example_source() -> str:
@@ -50,9 +63,19 @@ class Clock:
 class FakeClient:
     """Stands in for :class:`AsyncDongleClient`.
 
-    ``connected`` flips the way the real client's does: a raised
-    ``DongleError`` from ``poll()`` means the stream broke, so the socket is
-    dropped rather than left looking healthy.
+    ``connected`` flips the way the real client's does.  Three failure modes
+    are modelled separately, because the documented example treats them
+    differently:
+
+    * ``failing`` -- a timeout.  The stream broke, so the socket is dropped
+      and ``DongleError`` is raised; the ``finally`` arms the backoff.
+    * ``cancellable`` -- a caller cancels mid-poll.  The real client drops the
+      connection from ``_take()`` before the ``CancelledError`` escapes, so no
+      ``except DongleError`` ever sees it.  This is the case that makes the
+      ``finally`` necessary at all.
+    * ``healthy_error`` -- an error on a socket that stayed in sync, such as a
+      ``ModbusError`` under ``on_error="raise"``.  ``connected`` stays True,
+      so no backoff is armed.
     """
 
     default_reachable = True
@@ -67,6 +90,8 @@ class FakeClient:
         self.connect_calls = 0
         self.poll_calls = 0
         self.failing = False
+        self.cancellable = False
+        self.healthy_error = False
         type(self).instances.append(self)
 
     async def connect(self) -> None:
@@ -77,6 +102,14 @@ class FakeClient:
 
     async def poll(self) -> dict[str, dict[str, float]]:
         self.poll_calls += 1
+        if self.cancellable:
+            try:
+                await asyncio.Event().wait()      # never set: only cancel ends it
+            except BaseException:
+                self.connected = False            # _take() drops on cancellation
+                raise
+        if self.healthy_error:
+            raise DongleError("modbus exception code 1")   # socket kept
         if self.failing or not self.reachable:
             self.connected = False          # a timeout drops the connection
             raise DongleError("timed out waiting for a reply")
@@ -196,8 +229,9 @@ def test_backoff_stops_waiting_and_reconnects(build):
 
     Regression: the lockout guard used to sit inside the ``try``, so its
     ``UpdateFailed`` ran the ``finally`` and pushed ``retry_after`` forward
-    on every tick.  The deadline could never expire and a single transient
-    timeout at t=60 s left the entities unavailable until a reload.
+    on every tick.  The deadline could never expire, so a single transient
+    timeout on the first tick after setup left the entities unavailable
+    until the integration was reloaded.
     """
     clock = Clock(1000.0)
 
@@ -205,10 +239,10 @@ def test_backoff_stops_waiting_and_reconnects(build):
         update, client = await build(clock)
         assert client.poll_calls == 1          # first refresh succeeded
 
-        client.failing = True                  # one transient timeout at 60 s
+        client.failing = True        # one transient timeout, on the next tick
         first = await tick(update, clock)
         assert first[0][0] == "failed"
-        client.failing = False                 # dongle is fine straight after
+        client.failing = False       # dongle is fine straight after
 
         return client, await tick(update, clock, times=8)
 
@@ -266,3 +300,80 @@ def test_successful_polls_never_set_a_backoff(build):
     assert client.connect_calls == 1, "reconnected despite everything working"
     assert all(o[0] == "ok" for o in outcomes), outcomes
     assert all(o[1]["grid_frequency"]["value"] == 50.0 for o in outcomes)
+
+
+def test_cancelled_poll_sets_a_backoff(build):
+    """A cancelled poll backs off, though it never raises ``DongleError``.
+
+    This is the case the ``finally`` exists for.  A caller wrapping
+    ``poll()`` in ``asyncio.timeout`` is the normal Home Assistant pattern;
+    the client drops the connection from inside ``_take()``, so no
+    ``except DongleError`` runs and only a check in a ``finally`` can arm the
+    backoff.  Without it the next tick would reconnect straight into the
+    lockout.
+    """
+    clock = Clock(1000.0)
+
+    async def run():
+        update, client = await build(clock)
+        client.cancellable = True
+
+        calls_before = client.poll_calls
+        task = asyncio.create_task(update())
+        for _ in range(100):               # let the update reach poll()
+            if client.poll_calls > calls_before:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("async_update never reached poll()")
+
+        task.cancel()                      # what asyncio.timeout would do
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        dropped = not client.connected
+
+        client.cancellable = False         # dongle is healthy again
+        waiting = await tick(update, clock)
+        calls_after_cancel = client.connect_calls
+        later = await tick(update, clock, times=6)
+        return client, dropped, waiting, calls_after_cancel, later
+
+    client, dropped, waiting, calls_after_cancel, later = asyncio.run(run())
+
+    assert dropped, "the client must drop a connection torn by cancellation"
+    assert waiting[0][0] == "waiting", "no backoff was armed for the cancel"
+    assert calls_after_cancel == 1, "reconnected on the tick right after a cancel"
+    assert any(o[0] == "ok" for o in later), "backoff never expired"
+    assert client.connect_calls == 2, "never reconnected after the cancellation"
+
+
+def test_a_healthy_connection_is_not_backed_off(build):
+    """An error on a still-usable socket gets no backoff.
+
+    The docs say an ``EnvelopeError``, or a ``ModbusError`` raised under
+    ``on_error="raise"``, leaves the stream in sync and the connection worth
+    keeping.  So ``connected`` stays True, the ``finally`` must not arm the
+    lockout, and the next tick retries on the same socket rather than
+    spending 75 s waiting for nothing.
+    """
+    clock = Clock(1000.0)
+
+    async def run():
+        update, client = await build(clock)
+        client.healthy_error = True
+
+        failed = await tick(update, clock)
+        still_connected = client.connected
+        calls = client.connect_calls
+
+        client.healthy_error = False
+        next_tick = await tick(update, clock)
+        return client, failed, still_connected, calls, next_tick
+
+    client, failed, still_connected, calls, next_tick = asyncio.run(run())
+
+    assert failed[0][0] == "failed", failed
+    assert still_connected, "a healthy socket was dropped"
+    assert calls == 1, "reconnected despite a usable connection"
+    assert next_tick[0][0] == "ok", "backed off after a non-fatal error"
+    assert client.connect_calls == 1, "still no reconnect needed"

@@ -226,8 +226,9 @@ written from. Between polls those pushes accumulate in the TCP buffer and get
 answered on the next read.
 
 An interval of **30 s or less** plus one long-lived connection is the shape
-this was designed and tested around: no push backlog ever builds up, and
-nothing reconnects.
+this was designed around: with a read more often than the heartbeat period,
+any push is answered before the next one is due, so at most one sits pending
+and nothing ever reconnects.
 
 Reconnecting per poll is the obvious answer for longer gaps, but it only
 becomes necessary once the idle time exceeds the heartbeat period — and for
