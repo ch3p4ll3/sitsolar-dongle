@@ -158,9 +158,20 @@ The dongle emits unsolicited heartbeat pushes: `43 01` plus a 4-byte Unix
 timestamp, with protocol id `0x0001`.
 
 The official app answers each push with a heartbeat of its own, **reusing the
-push's transaction id**, so pushes do not pile up. `DongleClient` does the same
-transparently inside its frame iterator — you never see a heartbeat, and it
-never confuses a reply.
+push's transaction id**, so pushes do not pile up. Both clients in this library
+do the same — you never see a heartbeat, and it never confuses a reply:
+
+- `AsyncDongleClient` has a background reader that owns the connection and
+  answers the instant a push arrives, whatever the caller is doing.
+- `DongleClient` answers from inside its frame iterator, so a push is only
+  handled while a read is in flight.
+
+That difference is not cosmetic. Measured against real hardware, the dongle
+**closes a connection whose heartbeats go unanswered** — about five missed
+pushes, or roughly three minutes — while a session that answers them stayed up
+for ten minutes. So the blocking client is viable at polling intervals
+shorter than the heartbeat period and no longer, whereas the async client does
+not care how long the caller stays quiet.
 
 ```python
 # reply layout, built automatically

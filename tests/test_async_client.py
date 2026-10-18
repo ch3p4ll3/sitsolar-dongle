@@ -55,7 +55,11 @@ class FakeDongle:
     the two ways a handshake can fail after the socket is already open,
     ``reply_delay`` holds a reply long enough to cancel a read mid-frame, and
     ``stall_after_header`` sends a header and then nothing, which is what a
-    frame torn halfway really looks like on the wire.
+    frame torn halfway really looks like on the wire.  ``heartbeat_interval``
+    makes it push heartbeats on a timer whether or not anyone is asking,
+    ``die_after`` aborts the socket after a delay, and ``ignore_reads``
+    answers nothing but heartbeats -- the three states the reader task has to
+    cope with on real hardware.
     """
 
     def __init__(self, serial: str = SERIAL, *,
@@ -64,6 +68,8 @@ class FakeDongle:
                  accredit_refused: bool = False, corrupt_envelope: bool = False,
                  corrupt_reads: bool = False,
                  reply_delay: float = 0.0, stall_after_header: bool = False,
+                 heartbeat_interval: float = 0.0, die_after: float = 0.0,
+                 ignore_reads: bool = False,
                  host: str = "127.0.0.1") -> None:
         self.serial = serial
         self.keys = derive_keys(serial)
@@ -75,6 +81,9 @@ class FakeDongle:
         self.corrupt_reads = corrupt_reads
         self.reply_delay = reply_delay
         self.stall_after_header = stall_after_header
+        self.heartbeat_interval = heartbeat_interval
+        self.die_after = die_after
+        self.ignore_reads = ignore_reads
         self.host = host
         self.port = 0
         self.heartbeats = 0
@@ -84,6 +93,7 @@ class FakeDongle:
         self.disconnects = 0
         self.connections = 0
         self.requests: list[bytes] = []
+        self._beats = 0
         self._writers: set[asyncio.StreamWriter] = set()
         self._server: asyncio.Server | None = None
 
@@ -109,6 +119,10 @@ class FakeDongle:
                       writer: asyncio.StreamWriter) -> None:
         self.connections += 1
         self._writers.add(writer)
+        helpers = [asyncio.create_task(task(writer)) for task in (
+            self._beat if self.heartbeat_interval else None,
+            self._die if self.die_after else None,
+        ) if task is not None]
         try:
             while True:
                 header = await reader.readexactly(7)
@@ -129,6 +143,9 @@ class FakeDongle:
                     writer.write(seal_frame(push, self.keys, tid=0x4242,
                                             protocol=PROTO_PUSH))
                     await writer.drain()
+
+                if self.ignore_reads and payload[:6] == HEADER:
+                    continue        # a dongle that has gone quiet mid-session
 
                 reply = self._reply_for(payload)
                 if reply is None:
@@ -154,9 +171,41 @@ class FakeDongle:
         except (asyncio.IncompleteReadError, ConnectionError, EnvelopeError):
             pass
         finally:
+            for helper in helpers:
+                helper.cancel()
             self.disconnects += 1
             self._writers.discard(writer)
             writer.close()
+
+    async def _beat(self, writer: asyncio.StreamWriter) -> None:
+        """Push heartbeats on a timer, the way the real dongle does."""
+        try:
+            while not writer.is_closing():
+                await asyncio.sleep(self.heartbeat_interval)
+                self._beats += 1
+                push = CMD_HEARTBEAT + struct.pack(
+                    ">I", int(time.time()) & 0xFFFFFFFF)
+                # a distinct tid per push, so a client that answers them all
+                # cannot look like it answered one repeatedly
+                writer.write(seal_frame(push, self.keys,
+                                        tid=0x7000 + self._beats,
+                                        protocol=PROTO_PUSH))
+                await writer.drain()
+        except (ConnectionError, OSError, asyncio.CancelledError):
+            pass
+
+    async def _die(self, writer: asyncio.StreamWriter) -> None:
+        """Vanish without a handshake, the way a powered-off dongle does.
+
+        ``abort()`` sends RST rather than a clean FIN, which is what makes
+        the peer's ``readexactly`` fail instead of returning a short read.
+        """
+        try:
+            await asyncio.sleep(self.die_after)
+            if not writer.is_closing():
+                writer.transport.abort()
+        except (ConnectionError, OSError, asyncio.CancelledError):
+            pass
 
     def _seal_reply(self, reply: bytes, tid: int, *,
                     corrupt: bool = False) -> bytes:
@@ -337,6 +386,176 @@ def test_heartbeat_push_is_answered() -> None:
     asyncio.run(main())
 
 
+def test_heartbeat_while_idle_is_answered() -> None:
+    """A heartbeat arriving with no request in flight gets a prompt reply.
+
+    This is the behaviour measured against real hardware, and the reason the
+    reader task exists: the dongle closes a connection whose heartbeats go
+    unanswered, dropping a silent client after roughly five missed pushes,
+    while an identical session that answers them stayed up for ten minutes.
+    Answering only during reads leaves the connection viable for about three
+    minutes and no longer.
+    """
+    async def main() -> None:
+        async with FakeDongle(heartbeat_interval=0.1) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                # nothing is requested in this window, so every heartbeat
+                # here has to be answered by the reader on its own
+                await wait_until(lambda: dongle.heartbeats >= 3, timeout=3.0)
+                assert client.connected
+                # and the session is still good afterwards
+                assert await client.read(31002, 2) == (0, 0)
+
+    asyncio.run(main())
+
+
+def test_reader_keeps_an_idle_connection_alive() -> None:
+    """Several heartbeat periods of silence do not disturb the session.
+
+    The shape of the hardware experiment that motivated this design: leave
+    the connection alone well past the heartbeat period, then poll.  Under
+    the old scheme those pushes accumulated unanswered until the dongle
+    dropped the client.
+    """
+    async def main() -> None:
+        async with FakeDongle(heartbeat_interval=0.1) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                await asyncio.sleep(0.7)               # ~7 heartbeat periods
+                assert dongle.heartbeats >= 5, dongle.heartbeats
+                assert client.connected
+                assert await client.poll()
+
+    asyncio.run(main())
+
+
+def test_request_timeout_keeps_the_connection() -> None:
+    """A dongle that goes quiet mid-session does not cost the connection.
+
+    Under the old design a timeout tore the socket down, so a failed poll
+    also triggered the ~75 s reconnect lockout.  The reader consumes the
+    wire either way, so a late reply is discarded by transaction id and the
+    next request on the same socket is unaffected.
+    """
+    async def main() -> None:
+        async with FakeDongle(ignore_reads=True) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port, timeout=0.3,
+                                         keepalive=30.0) as client:
+                with pytest.raises(DongleError, match="timed out"):
+                    await client.read(31002, 2)
+
+                assert client.connected, \
+                    "a slow dongle must not cost the connection"
+
+                # the dongle starts answering again
+                dongle.ignore_reads = False
+                assert await client.read(31002, 2) == (0, 0)
+                assert client.connected
+
+    asyncio.run(main())
+
+
+def test_late_reply_is_discarded_not_misapplied() -> None:
+    """A reply arriving after its request timed out is simply dropped.
+
+    Discarding it is what keeps the stream on a frame boundary, which is
+    what makes a request timeout survivable without reconnecting.
+    """
+    async def main() -> None:
+        async with FakeDongle(reply_delay=0.5) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port, timeout=0.15,
+                                         keepalive=30.0) as client:
+                with pytest.raises(DongleError, match="timed out"):
+                    await client.read(31002, 2)
+
+                await asyncio.sleep(0.8)      # let the late reply land
+                dongle.reply_delay = 0.0
+                assert await client.read(31002, 2) == (0, 0)
+                assert client.connected
+
+    asyncio.run(main())
+
+
+def test_reader_detects_an_abrupt_disconnect() -> None:
+    """A dongle that vanishes is noticed without another request.
+
+    ``abort()`` sends RST rather than FIN, so ``readexactly`` fails outright
+    -- the same thing a powered-off dongle or a dropped wifi link looks like.
+    """
+    async def main() -> None:
+        async with FakeDongle(die_after=0.3) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                assert client.connected
+                await wait_until(lambda: not client.connected, timeout=3.0)
+
+    asyncio.run(main())
+
+
+def test_connection_loss_fails_a_pending_request_immediately() -> None:
+    """A request already waiting does not burn its full timeout.
+
+    The reader hands the failure straight to whoever is waiting, so a dead
+    dongle surfaces at once instead of after ``timeout`` seconds.
+    """
+    async def main() -> None:
+        async with FakeDongle(reply_delay=30.0, die_after=0.3) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port,
+                                         timeout=10.0) as client:
+                started = time.monotonic()
+                with pytest.raises(DongleError, match="connection"):
+                    await client.read(31002, 2)
+                elapsed = time.monotonic() - started
+                assert elapsed < 3.0, "waited %.1fs for a dead dongle" % elapsed
+                assert not client.connected
+
+    asyncio.run(main())
+
+
+def test_reconnect_after_the_reader_dies() -> None:
+    """A dropped connection can be reopened on the same client object."""
+    async def main() -> None:
+        async with FakeDongle(die_after=0.2) as dongle:
+            client = AsyncDongleClient(dongle.host, SERIAL, port=dongle.port)
+            await client.connect()
+            await wait_until(lambda: not client.connected, timeout=3.0)
+
+            dongle.die_after = 0.0         # the dongle is stable again
+            info = await client.connect()
+            assert info.serial == SERIAL
+            assert await client.read(31002, 2) == (0, 0)
+            await client.close()
+
+    asyncio.run(main())
+
+
+def test_a_stale_reader_cannot_fail_a_new_connection() -> None:
+    """A reader from a replaced connection leaves the replacement alone.
+
+    The generation is what tells them apart: a reader only ever tears down
+    the connection it was started for. Without that, a reader that happened
+    to wake up during a reconnect would fail the new session's requests and
+    drop a perfectly good socket.
+    """
+    async def main() -> None:
+        async with FakeDongle() as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                client._connection_lost(client._generation - 1,
+                                        "a stale reader says so")
+
+                assert client.connected, \
+                    "an old reader must not drop a live connection"
+                assert client._dead_reason is None
+                assert await client.read(31002, 2) == (0, 0)
+
+    asyncio.run(main())
+
+
 def test_wrong_serial_fails_and_closes() -> None:
     async def main() -> None:
         async with FakeDongle() as dongle:
@@ -468,61 +687,66 @@ def test_connection_refusal_is_a_dongle_error() -> None:
     asyncio.run(main())
 
 
-def test_cancellation_drops_the_connection() -> None:
-    """A read cancelled mid-frame must not leave a torn stream behind.
+def test_cancellation_keeps_the_connection() -> None:
+    """Cancelling a read no longer tears the connection down.
 
-    Wrapping a call in ``asyncio.timeout`` and letting it expire is the
-    normal Home Assistant pattern.  Without the drop, the next read would
-    sit waiting for the rest of the torn frame and then burn the whole
-    timeout before failing.
+    Wrapping a call in ``asyncio.timeout`` is the normal Home Assistant
+    pattern.  The reader owns the stream now, so a cancelled request only
+    abandons its own future: the reply already on the wire is consumed and
+    discarded by transaction id, and the next request reuses the socket.
+    Previously this dropped the connection, which under the dongle's ~75 s
+    reconnect lockout cost a 75 s outage for a routine cancellation.
     """
     async def main() -> None:
-        async with FakeDongle(reply_delay=5.0) as dongle:
+        async with FakeDongle(reply_delay=3.0) as dongle:
             async with AsyncDongleClient(dongle.host, SERIAL,
                                          port=dongle.port,
                                          timeout=10.0) as client:
                 task = asyncio.create_task(client.read(31002, 2))
-                await asyncio.sleep(0.2)          # let it get into _take
+                await asyncio.sleep(0.2)          # let it get into the wait
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
 
-                assert not client.connected
+                assert client.connected, \
+                    "a cancelled request must not drop the connection"
 
-                # a fresh connect starts clean rather than inheriting the
-                # half-read frame
-                started = time.monotonic()
-                info = await client.connect()
-                assert info.serial == SERIAL
-                assert time.monotonic() - started < 2.0
+                # the reply to the cancelled request is still on its way; it
+                # has to be consumed and dropped, not mistaken for an answer
+                dongle.reply_delay = 0.0
+                assert await client.read(31002, 2) == (0, 0)
+                assert client.connected
 
     asyncio.run(main())
 
 
-def test_cancellation_after_the_header_tears_the_frame() -> None:
-    """The case that actually leaves a half-consumed frame on the stream.
+def test_reader_reclaims_a_connection_torn_mid_frame() -> None:
+    """A dongle that stalls mid-frame is reclaimed by the reader.
 
-    Here the 7-byte header has been read and the body never arrives, so a
-    client that did not drop would spend its next read waiting for the rest
-    of a frame whose declared length it can no longer trust.
+    The header reaches the client and the body never does, so the stream is
+    genuinely torn -- but only the reader knows, because it is the reader
+    that consumed the header.  A caller cancelling its request cannot repair
+    that, so the keepalive is what notices, and it does so without anybody
+    having to reconnect by hand.
     """
     async def main() -> None:
         async with FakeDongle(stall_after_header=True) as dongle:
             async with AsyncDongleClient(dongle.host, SERIAL,
                                          port=dongle.port,
-                                         timeout=10.0) as client:
+                                         timeout=10.0, keepalive=0.8) as client:
                 task = asyncio.create_task(client.read(31002, 2))
-                # wait for the header to be on the wire, then give the client
-                # time to consume it and start awaiting the body
+                # wait for the header to be on the wire, then cancel: the
+                # reader is left holding a half-consumed frame
                 await wait_until(lambda: dongle.stalled)
                 await asyncio.sleep(0.2)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
 
-                assert not client.connected
+                # live until the keepalive expires, then gone
+                assert client.connected
+                await wait_until(lambda: not client.connected, timeout=3.0)
 
-                # reconnecting must not inherit the stalled frame
                 started = time.monotonic()
                 info = await client.connect()
                 assert info.serial == SERIAL

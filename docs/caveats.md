@@ -30,6 +30,14 @@ Everything here assumes the pessimistic reading, so anything that fails should
 back off rather than retry on the next tick.
 !!!
 
+One *drop* trigger is now pinned down, though. Against real hardware a session
+that left heartbeats unanswered was closed by the dongle after about five
+missed pushes — roughly three minutes — while an identical session that answered
+them stayed up for ten minutes. `AsyncDongleClient` answers them from its
+background reader, which removes that failure mode entirely; `DongleClient`
+only answers during a read, so keep its polling interval shorter than the ~37 s
+heartbeat period.
+
 | Do | Don't |
 |---|---|
 | Keep each session on a **single socket**. | Open a new connection per sample. |

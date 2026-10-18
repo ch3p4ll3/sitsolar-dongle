@@ -45,7 +45,7 @@ Requests flow through four layers, each with one job:
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| Transport | `client.py`, `async_client.py` | Socket/streams, handshake, heartbeat replies, tid matching. |
+| Transport | `client.py`, `async_client.py` | Socket/streams, handshake, heartbeat replies, tid matching. The async side does this in a background reader task that owns the stream. |
 | Session | `session.py` | `ClientCore`, shared by both transports: key setup, frame sealing, `BeforeAccredit`/`CallAll` parsing, `poll()` assembly. |
 | Framing | `framing.py` | Outer header, inner Modbus RTU frame, error taxonomy. |
 | Envelope | `crypto.py`, `crc.py` | AES-128-CBC + HMAC-SHA256, key derivation, CRC16. |
@@ -58,16 +58,29 @@ and asyncio clients cannot drift apart.
 
 Two design points are worth calling out:
 
-**Heartbeats are answered while frames are being read.** The frame reader pops
-frames off the wire and, on seeing a push, answers it and continues — so a
-heartbeat can never be mistaken for a reply, and callers see only frames
-matching their transaction id.
+**Heartbeats are answered by a task that owns the stream.** In the asyncio
+client, `_reader_loop` is the only thing that reads. It pops frames off the
+wire and, on seeing a push, answers it and continues — so a heartbeat can never
+be mistaken for a reply, and every request gets its frame handed to it by
+transaction id through a future in `_pending`.
 
-What that does *not* cover is the idle gap between polls: nothing reads while
-no request is in flight, so pushes accumulate in the TCP buffer and are
-answered in a burst on the next read. That is fine at polling intervals
-shorter than the ~37 s heartbeat period seen in our captures, but whether the
-dongle tolerates a client that stays silent for minutes has not been tested.
+Single ownership is what makes cancellation safe. Cancelling a request only
+abandons that request's future; the reader has already consumed whatever was on
+the wire, so the stream stays on a frame boundary and the next request reuses
+the socket. Under the older design every read owned the socket, so a cancelled
+poll tore the connection down — and against the dongle's ~75 s reconnect
+lockout that turned a routine cancellation into a 75 s outage.
+
+The reader also watches for a dead peer. It declares the connection finished on
+a closed socket, an RST, or `keepalive` (90 s) of total silence, and hands the
+failure to any request waiting on it rather than letting it burn its full
+`timeout`. Silence is judged across *all* traffic, not just heartbeats, so a
+live connection never trips it however long the caller stays quiet.
+
+The blocking client has no such task — it answers a heartbeat only while a read
+is in flight. Measured against real hardware, the dongle drops a connection
+whose heartbeats go unanswered after about five missed pushes, so that approach
+is viable for roughly three minutes and no longer.
 
 **Sealing rebuilds the header by hand.** The outer 7-byte header must survive in
 the clear while the protocol id is patched from `0x0000` to `0x1000` *after*

@@ -160,9 +160,9 @@ async with AsyncDongleClient("192.168.1.50", "<DONGLE_SERIAL>") as dongle:
     values = await dongle.poll()
 ```
 
-The constructor takes the same parameters as [`DongleClient`](#dongleclient).
-Every method that touches the wire is a coroutine; the returned values,
-exceptions and `poll()` shape are identical.
+The constructor takes the same parameters as [`DongleClient`](#dongleclient)
+plus one of its own. Every method that touches the wire is a coroutine; the
+returned values, exceptions and `poll()` shape are identical.
 
 | | Blocking | Async |
 |---|---|---|
@@ -172,6 +172,14 @@ exceptions and `poll()` shape are identical.
 | Raw read | `dongle.read(31002, 2)` | `await dongle.read(31002, 2)` |
 | Full poll | `dongle.poll()` | `await dongle.poll()` |
 | Devices | `dongle.devices()` | `await dongle.devices()` |
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `keepalive` | `90.0` | Seconds the background reader may hear nothing at all before it concludes the peer is gone. Heartbeats arrive every ~37 s on a live link, so this is several missed pushes, not one slow reply. It exists for half-open connections that never send a FIN, which `readexactly` would otherwise block on forever. |
+
+`interframe` is accepted for symmetry with the blocking client but ignored:
+every request here gets exactly one reply, so there is no multi-frame gap to
+pace.
 
 ### `connected -> bool`
 
@@ -196,46 +204,55 @@ a timeout all surface as `DongleError`, so one `except` covers them — see
 connection.
 !!!
 
-!!!warning A failed or interrupted connection closes itself
-Anything that interrupts a read **mid-frame** — a timeout, the peer going
-away, or **the caller cancelling the task** — drops the connection rather
-than leaving a half-received frame on the stream. Reconnect with
-`await connect()`.
+!!!success A cancelled or timed-out request costs nothing
+The reader task owns the stream, so a request only ever abandons its own
+future. Cancelling it — the normal `asyncio.timeout` pattern in Home
+Assistant — or letting it time out leaves the connection usable, and the next
+request goes out on the same socket. A reply that turns up after its request
+gave up is discarded by transaction id, which is what keeps the stream on a
+frame boundary.
 
-Cancelling matters in practice: wrapping a call in `asyncio.timeout` and
-letting it expire is the normal Home Assistant pattern, and without the drop
-the next request would sit waiting for the rest of the torn frame and then
-burn a full `timeout` before failing.
+This matters more than it sounds. Under a design where every read owned the
+socket, a cancelled poll dropped the connection; against the dongle's ~75 s
+reconnect lockout that turned a routine cancellation into a 75 s outage.
+!!!
 
-The drop is synchronous (`writer.close()`), so it works from a cancellation
-handler that may never be scheduled again.
+!!!warning A dead connection drops itself
+When the reader concludes the connection is finished — the peer closed it,
+sent RST, or went silent — the connection is dropped, `connected` reports
+`False`, and any request waiting on it fails immediately instead of burning
+its full `timeout`. Reconnect with `await connect()`.
+
+Silence is judged by `keepalive` (90 s by default). Heartbeats arrive roughly
+every 37 s on a live link, so this is several missed pushes rather than one
+slow reply, and it exists for half-open connections that never send a FIN,
+which `readexactly` would otherwise block on forever.
 !!!
 
 !!!info A bad envelope does *not* drop the connection
 An `EnvelopeError` means the frame was read in full and only then failed
-authentication, so the stream is still sitting on a clean frame boundary and
-the connection stays usable — `connected` remains `True` and the next request
-goes out on the same socket. Only `connect()` tears down after a failure,
-because there the handshake has failed outright and there is nothing worth
-keeping.
+authentication, so the stream is still on a clean frame boundary. The reader
+consumes the frame and hands it to the waiting request, and that is where the
+check happens — so `connected` stays `True` and the next request goes out on
+the same socket. Only `connect()` tears down after a failure, because there
+the handshake has failed outright and there is nothing worth keeping.
 !!!
 
-!!!info Heartbeats are answered while a read is in flight
-The dongle pushes a heartbeat roughly every 37 s in the captures this was
-written from. Between polls those pushes accumulate in the TCP buffer and get
-answered on the next read.
+!!!success Heartbeats are answered immediately, by a background reader
+The dongle pushes a heartbeat roughly every 37 s. A background task owns the
+connection and replies the moment one arrives, exactly as the official app
+does, so your polling interval has no bearing on whether the session survives.
 
-An interval of **30 s or less** plus one long-lived connection is the shape
-this was designed around: with a read more often than the heartbeat period,
-any push is answered before the next one is due, so at most one sits pending
-and nothing ever reconnects.
+This is measured, not assumed. Against real hardware a session that left
+heartbeats unanswered was **dropped by the dongle** after about five missed
+pushes — roughly three minutes — while an identical session that answered them
+stayed up for ten minutes and polled normally throughout. Answering only
+during reads is therefore viable for about three minutes and no longer, which
+is why this client does not do it.
 
-Reconnecting per poll is the obvious answer for longer gaps, but it only
-becomes necessary once the idle time exceeds the heartbeat period — and for
-intervals between roughly 37 s and 75 s it walks straight into the reconnect
-lockout described in [Caveats](caveats.md#one-connection-at-a-time). What the
-dongle does with a client that stays silent for minutes has not been tested,
-so treat intervals above ~30 s as uncharacterised rather than safe.
+The consequences for you: a long-lived connection is safe at any polling
+interval, reconnecting per poll is unnecessary, and the gap between roughly
+37 s and 75 s that used to collide with the reconnect lockout is gone.
 !!!
 
 !!!warning One client per dongle
@@ -287,14 +304,14 @@ async def async_setup_entry(hass, entry, async_add_entities):
         except DongleError as exc:
             raise UpdateFailed(str(exc)) from exc
         finally:
-            # `finally`, not the except: a cancelled poll drops the connection
-            # from inside _take() without ever raising DongleError, so this
-            # is the only place that covers it.  It is also why close() is
+            # `connected` only goes False when the reader concludes the
+            # connection is finished: the peer closed it, sent RST, or went
+            # silent for `keepalive`.  A cancelled or timed-out request
+            # leaves it True, so this arms the backoff for a genuinely dead
+            # connection and not for a slow one.  It is also why close() is
             # not called above -- an EnvelopeError or a ModbusError raised
-            # under on_error="raise" leaves a healthy socket that is worth
-            # keeping, and `connected` stays True so no backoff is set.
-            # Only genuine attempts reach this point, so every set of
-            # `retry_after` here marks a real failure.
+            # under on_error="raise" leaves a healthy socket worth keeping,
+            # and `connected` stays True so no backoff is set.
             if not dongle.connected:
                 state["retry_after"] = time.monotonic() + RECONNECT_AFTER
 
@@ -311,12 +328,16 @@ async def async_setup_entry(hass, entry, async_add_entities):
     )
 ```
 
-!!!success Let the client decide when to drop
-The client tears the connection down itself on anything that breaks the
-stream — a timeout, a closed peer, a cancelled task — so the handler above
-does not need to call `close()`. What it does need is the `finally`: a
-cancelled poll never raises `DongleError`, so checking `dongle.connected`
-after every outcome is the only way the backoff gets set for one.
+!!!success Let the reader decide when to drop
+The reader task owns the stream, so it is the only thing that knows when the
+connection is really finished. It tears itself down on a closed peer, an RST,
+or `keepalive` of silence, and the handler above never has to call `close()`.
+
+A cancelled or timed-out request does **not** drop anything: the reader has
+already consumed whatever was on the wire, and the reply that turns up late
+is discarded by transaction id. So `connected` is meaningful — it goes False
+exactly when the connection is dead, which is what the `finally` above keys
+the backoff off.
 
 Keeping a connection that is still healthy is deliberate. An `EnvelopeError`,
 or a `ModbusError` raised under `on_error="raise"`, leaves the stream in sync,
