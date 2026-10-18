@@ -23,14 +23,18 @@ dongle-reader/
 │   ├── __init__.py            Public API surface
 │   ├── __main__.py            `python -m sitsolar_dongle`
 │   ├── cli.py                 Command-line interface
-│   ├── client.py              DongleClient: session, handshake, reads
+│   ├── client.py              DongleClient: blocking transport
+│   ├── async_client.py        AsyncDongleClient: asyncio transport
+│   ├── session.py             ClientCore: logic shared by both clients
+│   ├── errors.py              DongleError, the base exception
 │   ├── crypto.py              Key derivation + AES/HMAC envelope
 │   ├── crc.py                 Vendor CRC16 + selftest
 │   ├── framing.py             Header, inner RTU frames, error types
 │   ├── decode.py              Raw words -> decoded readings
 │   └── registers.py           The register map
 └── tests/
-    └── test_dongle.py         CRC vectors, framing, decoding
+    ├── test_dongle.py         CRC vectors, framing, decoding
+    └── test_async_client.py   Async client against a scripted dongle
 ```
 
 ---
@@ -41,34 +45,129 @@ Requests flow through four layers, each with one job:
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| Session | `client.py` | Socket lifecycle, handshake, heartbeat replies, tid matching. |
+| Transport | `client.py`, `async_client.py` | Socket/streams, handshake, heartbeat replies, tid matching. The async side does this in a background reader task that owns the stream. |
+| Session | `session.py` | `ClientCore`, shared by both transports: key setup, frame sealing, `BeforeAccredit`/`CallAll` parsing, `poll()` assembly. |
 | Framing | `framing.py` | Outer header, inner Modbus RTU frame, error taxonomy. |
 | Envelope | `crypto.py`, `crc.py` | AES-128-CBC + HMAC-SHA256, key derivation, CRC16. |
 | Semantics | `registers.py`, `decode.py` | What each register means and how to turn words into values. |
 
+The two transports implement only the bytes on and off the wire. Anything
+they would otherwise duplicate — the handshake parsing, `seal_frame()`, the
+refused-range bookkeeping in `poll()` — lives in `ClientCore`, so the blocking
+and asyncio clients cannot drift apart.
+
 Two design points are worth calling out:
 
-**Heartbeats are answered inside the frame iterator.** `_iter_frames()` pops
-frames off the wire and, on seeing a push, answers it and continues — so a
-heartbeat can never be mistaken for a reply, and pushes never pile up. Callers
-see only frames matching their transaction id.
+**Heartbeats are answered by a task that owns the stream.** In the asyncio
+client, `_reader_loop` is the only thing that reads. It pops frames off the
+wire and, on seeing a push, answers it and continues — so a heartbeat can never
+be mistaken for a reply, and every request gets its frame handed to it by
+transaction id through a future in `_pending`.
+
+Single ownership is what makes cancellation safe. Cancelling a request only
+abandons that request's future; the reader has already consumed whatever was on
+the wire, so the stream stays on a frame boundary and the next request reuses
+the socket. Under the older design every read owned the socket, so a cancelled
+poll tore the connection down — and against the dongle's ~75 s reconnect
+lockout that turned a routine cancellation into a 75 s outage.
+
+The reader also watches for a dead peer. It declares the connection finished on
+a closed socket, an RST, `keepalive` of silence, or three consecutive request
+timeouts, and hands the failure to any request waiting on it rather than letting
+it burn its full `timeout`. Silence is judged across *all* traffic, not just
+heartbeats, so a live connection never trips it however long the caller stays
+quiet, and `keepalive` defaults to three heartbeat periods rather than a hard
+number — the 37 s interval was measured on one device and is not a protocol
+constant.
+
+Two details are easy to get wrong and worth knowing about:
+
+**The loop is a module-level function, not a method.** A task holds a strong
+reference to its coroutine, and a coroutine holds `self` — so a reader method
+would keep its client alive forever. That would be a real defect here: a client
+dropped without `close()` would hold its connection open, and the dongle serves
+one connection at a time, so it would lock every other client out until
+restarted. `_reader_loop` is handed `weakref.ref(self)` instead and releases
+even that before each read, so an abandoned client is collected and the reader
+hangs up on the next frame. There is a test that asserts the client is actually
+collectable, and it fails if the reference is made strong again.
+
+**Three timeouts in a row drop the connection.** `keepalive` only sees total
+silence, so a dongle that completes the handshake and then never answers reads
+leaves `connected` stuck on True while every poll fails — and anything keying
+its reconnect off `connected` would retry that dead socket forever. A single
+timeout still leaves the connection alone, because a slow inverter is not a
+broken one; only a run of them is.
+
+The blocking client has no such task — it answers a heartbeat only while a read
+is in flight. The hardware measurement (below) shows the dongle drops a
+connection whose heartbeats go unanswered after about five missed pushes, but it
+compared "never answer" against "answer immediately", so what it says about the
+blocking client's *late* answers is inference rather than measurement.
 
 **Sealing rebuilds the header by hand.** The outer 7-byte header must survive in
 the clear while the protocol id is patched from `0x0000` to `0x1000` *after*
-encryption. `_seal_frame()` therefore splits the header off, seals the payload,
+encryption. `seal_frame()` therefore splits the header off, seals the payload,
 rejoins, and patches the protocol and length fields — mirroring `utils.a.m58`.
+Both clients reach it through `ClientCore._seal()`.
+
+---
+
+## Measured behaviour
+
+Several claims in these docs rest on measurements rather than on reading the
+protocol. `tools/hw_probe.py` is what produced them; it is deliberately kept
+out of the sdist and out of `testpaths`, so it neither ships nor gets collected.
+
+Run against a single Si-Dongle-L (serial redacted — it is a credential, since
+both session keys derive from it) on a quiet LAN, 600 s of idling:
+
+| Mode | Result |
+|---|---|
+| `passive` — connect, then never read | `backlog 5, answered 0`, then `FAILED: DongleError: connection closed by the dongle` |
+| `pumped` — connect, answer pushes from a background reader | `backlog 0, answered 16, poll s 10.51`, then `SURVIVED` |
+
+Heartbeats arrived roughly every 37 s, so 16 answered pushes over 600 s is what
+a healthy session should look like. The passive run accumulating exactly five
+and then being cut off is where "the dongle drops a client after about five
+unanswered pushes" comes from — about 185 s.
+
+### What that does and does not establish
+
+- **Measured:** a client that never answers is dropped; one that answers
+  immediately is not. That is the basis for the background reader.
+- **Inferred, not measured:** the exact kill time. Five is read from the
+  backlog counter flat-lining, not from watching the clock, so treat ~185 s as
+  an estimate. The probe logs enough to pin it down — the missing piece is the
+  line where the backlog stops growing.
+- **Inferred, not measured:** what the blocking client's *late*, bursty
+  answers do. The probe compared "never" against "immediately", which brackets
+  but does not cover "eventually". A third mode that drains queued pushes on a
+  timer would settle it.
+- **Not measured at all:** what triggers the ~75 s reconnect lockout. See
+  [Caveats](caveats.md#one-connection-at-a-time).
+- **Unexplained:** `poll s 10.51` in the pumped run, against roughly 1 s in the
+  documented happy path. A no-idle baseline would show whether that is this
+  dongle's normal or overhead in the pump.
+
+To reproduce, use `--sn-file` rather than `--sn` so the serial stays out of
+your shell history:
+
+```bash
+python tools/hw_probe.py --host <dongle-ip> --sn-file ./sn idle --seconds 600
+```
 
 ---
 
 ## Running the tests
 
-The suite needs no `pytest`:
+`test_dongle.py` needs nothing beyond the package itself:
 
 ```bash
 PYTHONPATH=src python tests/test_dongle.py
 ```
 
-Or, if you installed the dev extra:
+The async client tests use `pytest.raises`, so run the whole suite with:
 
 ```bash
 pytest tests/
@@ -100,6 +199,14 @@ corrupted. The tables are pinned by tests for exactly this reason.
 
 `sitsolar_dongle.crc.selftest()` also runs at import time and refuses to start
 the module if the tables fail.
+
+`tests/test_async_client.py` takes a different approach: it runs the asyncio
+client against an **in-process scripted dongle** that derives the same keys,
+decrypts the real frames the client sends, and answers `BeforeAccredit`,
+`Accredit`, `CallAll` and FC reads the way the hardware does. That is what
+makes the failure paths testable without hardware — a refused `Accredit`, a
+corrupted HMAC, a reply that never arrives, and a read cancelled mid-frame are
+all driven by fault-injection flags on the fake.
 
 ---
 

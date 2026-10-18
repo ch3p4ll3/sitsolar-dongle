@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from Crypto.Cipher import AES
 
 from .crc import crc16
+from .errors import DongleError
 
 __all__ = ["EnvelopeError", "Keys", "derive_keys", "seal", "open_envelope"]
 
@@ -40,8 +41,13 @@ _BLOCK = 16
 _MAC = 32
 
 
-class EnvelopeError(Exception):
-    """Raised when a frame fails authentication or cannot be decrypted."""
+class EnvelopeError(DongleError):
+    """A frame failed authentication or could not be decrypted.
+
+    Subclass of :class:`~sitsolar_dongle.errors.DongleError`, so a caller
+    that only cares whether the dongle answered correctly can catch that
+    instead.
+    """
 
 
 @dataclass(frozen=True)

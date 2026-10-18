@@ -10,8 +10,13 @@ The CLI is a thin wrapper. Everything it does is available as a library, from a
 single import:
 
 ```python
-from sitsolar_dongle import DongleClient
+from sitsolar_dongle import DongleClient          # blocking
+from sitsolar_dongle import AsyncDongleClient     # asyncio
 ```
+
+Both share the same protocol core, register map and exceptions — pick the
+[blocking client](#dongleclient) for scripts and the
+[async client](#asyncdongleclient) for event loops such as Home Assistant.
 
 Only reads are implemented; nothing in this package ever writes to the
 inverter.
@@ -142,6 +147,279 @@ identical.
 
 ---
 
+## `AsyncDongleClient`
+
+The same session, spoken with `asyncio`. Use this from Home Assistant, FastAPI
+or any long-running service — `DongleClient` blocks the event loop it is called
+from.
+
+```python
+from sitsolar_dongle import AsyncDongleClient
+
+async with AsyncDongleClient("192.168.1.50", "<DONGLE_SERIAL>") as dongle:
+    values = await dongle.poll()
+```
+
+The constructor takes the same core parameters as [`DongleClient`](#dongleclient),
+plus two about the heartbeat. Every method that touches the wire is a
+coroutine; the returned values, exceptions and `poll()` shape are identical.
+
+| | Blocking | Async |
+|---|---|---|
+| Open | `connect()` | `await connect()` |
+| Close | `close()` | `await close()` |
+| Identity | `dongle.info` | `dongle.info` |
+| Raw read | `dongle.read(31002, 2)` | `await dongle.read(31002, 2)` |
+| Full poll | `dongle.poll()` | `await dongle.poll()` |
+| Devices | `dongle.devices()` | `await dongle.devices()` |
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `heartbeat` | `37.0` | Seconds between the dongle's heartbeat pushes. Only used to derive `keepalive`. |
+| `keepalive` | `3 × heartbeat` | Seconds the background reader may hear nothing at all before it concludes the peer is gone. It exists for half-open connections that never send a FIN, which `readexactly` would otherwise block on forever. |
+
+!!!warning `heartbeat` is a measurement, not a protocol constant
+The 37 s figure was measured on one Si-Dongle-L. Nothing in the protocol
+documentation fixes that interval, and there is no command in this library to
+ask the dongle what it uses — so if your firmware pushes less often than every
+37 s, a healthy idle link would be declared dead roughly every `keepalive`
+seconds and reconnect in a loop.
+
+If you see that, set `heartbeat` to your dongle's real period and `keepalive`
+follows. `interframe` is accepted for symmetry with the blocking client but
+ignored here: every request gets exactly one reply, so there is no multi-frame
+gap to pace.
+!!!
+
+### `connected -> bool`
+
+True while there is a live connection to the dongle.
+
+It goes False when the connection really is finished: the peer closed it, sent
+RST, said nothing for `keepalive`, **or ignored three requests in a row**. That
+last case matters — a dongle can finish the handshake and then never answer a
+read, which leaves the socket perfectly healthy and `connected` stuck on True.
+Three consecutive timeouts is what breaks the tie, so a client keying its
+reconnect off `connected` recovers rather than retrying a dead socket forever.
+A successful reply resets the count, so a merely busy inverter is not
+mistaken for a dead link.
+
+!!!danger Always `await close()`, or use `async with`
+The background reader keeps the client alive for as long as it is connected,
+so dropping the last reference does **not** free the connection the way it used
+to — the reader holds it open. The dongle serves one connection at a time, so a
+leaked client locks every other client out until the dongle is restarted.
+
+In a Home Assistant integration, `entry.async_on_unload(dongle.close)` is the
+one line that makes unloading safe. `close()` is bounded, so an unload cannot
+hang on a dead link.
+!!!
+
+### How it differs from the blocking client
+
+!!!info Built for an event loop
+Nothing blocks: there is no `socket`, `time.sleep` or synchronous `recv`
+anywhere in the module.
+
+Concurrent callers are serialised by an `asyncio.Lock`, so two tasks awaiting
+`poll()` and `read()` on the same client never interleave frames on the wire.
+
+Every read is bounded by `timeout`.
+!!!
+
+!!!success Every failure is a `DongleError`
+A refused connection, a refused `Accredit`, a bad HMAC, a Modbus exception or
+a timeout all surface as `DongleError`, so one `except` covers them — see
+[Exceptions](#exceptions). A caller cannot accidentally miss one and leak the
+connection.
+!!!
+
+!!!success A cancelled or timed-out request costs nothing
+The reader task owns the stream, so a request only ever abandons its own
+future. Cancelling it — the normal `asyncio.timeout` pattern in Home
+Assistant — or letting it time out leaves the connection usable, and the next
+request goes out on the same socket. A reply that turns up after its request
+gave up is discarded by transaction id, which is what keeps the stream on a
+frame boundary.
+
+This matters more than it sounds. Under a design where every read owned the
+socket, a cancelled poll dropped the connection; against the dongle's ~75 s
+reconnect lockout that turned a routine cancellation into a 75 s outage.
+!!!
+
+!!!warning A dead connection drops itself
+When the reader concludes the connection is finished — the peer closed it, sent
+RST, said nothing for `keepalive`, or ignored three requests in a row — the
+connection is dropped, `connected` reports `False`, and any request waiting on
+it fails immediately instead of burning its full `timeout`. Reconnect with
+`await connect()`.
+
+Silence is judged across *all* traffic, not just heartbeats, and defaults to
+three heartbeat periods — so it tolerates a couple of missed pushes while still
+catching a half-open connection that never sends a FIN, which `readexactly`
+would otherwise block on forever.
+!!!
+
+!!!info A bad envelope does *not* drop the connection
+An `EnvelopeError` means the frame was read in full and only then failed
+authentication, so the stream is still on a clean frame boundary. The reader
+consumes the frame and hands it to the waiting request, and that is where the
+check happens — so `connected` stays `True` and the next request goes out on
+the same socket. Only `connect()` tears down after a failure, because there
+the handshake has failed outright and there is nothing worth keeping.
+!!!
+
+!!!success Heartbeats are answered immediately, by a background reader
+The dongle pushes a heartbeat roughly every 37 s. A background task owns the
+connection and replies the moment one arrives, exactly as the official app
+does, so your polling interval has no bearing on whether the session survives.
+
+This is measured, not assumed — for the case it tested. Against real hardware a
+session that left heartbeats unanswered was **dropped by the dongle** after
+about five missed pushes — roughly three minutes — while an identical session
+that answered each push immediately stayed up for ten minutes and polled
+normally throughout.
+
+!!!question What was *not* measured
+The probe compared "never answer" against "answer immediately". The blocking
+client sits between those: it lets pushes queue and answers them in a burst at
+the next read, which is late rather than never. Whether the dongle counts a
+late answer the same as a prompt one has **not** been tested, so the advice to
+keep the blocking client's polling interval under the heartbeat period is a
+reasonable guess from the mechanism, not a finding.
+
+`tools/hw_probe.py` is in the repository; a third mode that drains queued
+pushes on a timer would settle it.
+!!!
+
+The consequences for you: a long-lived connection is safe at any polling
+interval, reconnecting per poll is unnecessary, and the gap between roughly
+37 s and 75 s that used to collide with the reconnect lockout is gone.
+!!!
+
+!!!warning One client per dongle
+The lock serialises requests *within* a client. To poll several dongles,
+create one `AsyncDongleClient` per device: nothing is shared globally, so they
+all run concurrently.
+!!!
+
+### Using it from Home Assistant
+
+`AsyncDongleClient` deliberately carries no `homeassistant` dependency, so this
+library never pins you to one HA release. Wire it into an integration with a
+`DataUpdateCoordinator`:
+
+```python
+from datetime import timedelta
+import logging
+import time
+
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from sitsolar_dongle import AsyncDongleClient, DongleError
+
+_LOGGER = logging.getLogger(__name__)
+
+# The dongle stops accepting fresh connections for roughly 75 s after a
+# connection drops, so retrying on every 15-second tick would only ever
+# collide with that lockout.
+RECONNECT_AFTER = 75.0
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    dongle = AsyncDongleClient(entry.data["host"], entry.data["serial"],
+                               timeout=10.0)
+    # Always close.  The client runs a background reader for as long as it is
+    # connected, and that reader keeps the client alive -- so a client left to
+    # the garbage collector holds its connection open, and the dongle serves
+    # only one connection at a time.  Reloading this entry without closing
+    # would lock every other client out until the dongle is restarted.
+    entry.async_on_unload(dongle.close)
+    state = {"retry_after": 0.0}
+
+    async def async_update():
+        # A lockout that is still running is not a failure.  This guard sits
+        # *outside* the try on purpose: if it were inside, the finally below
+        # would push `retry_after` forward on every tick and the backoff
+        # would never expire, leaving the entities unavailable for good.
+        if not dongle.connected and time.monotonic() < state["retry_after"]:
+            raise UpdateFailed("waiting out the reconnect lockout")
+
+        try:
+            if not dongle.connected:
+                await dongle.connect()
+            return await dongle.poll()
+        except DongleError as exc:
+            raise UpdateFailed(str(exc)) from exc
+        finally:
+            # `connected` only goes False when the connection really is
+            # finished: the peer closed it, sent RST, went silent for
+            # `keepalive`, or ignored three requests in a row.  A cancelled
+            # or merely slow request leaves it True, so this arms the
+            # backoff for a genuinely dead connection and not for a slow
+            # one.  It is also why close() is not called above -- an
+            # EnvelopeError or a ModbusError raised under on_error="raise"
+            # leaves a healthy socket worth keeping, and `connected` stays
+            # True so no backoff is set.
+            if not dongle.connected:
+                state["retry_after"] = time.monotonic() + RECONNECT_AFTER
+
+    coordinator = DataUpdateCoordinator(
+        hass, _LOGGER,
+        name="sitsolar",
+        update_method=async_update,
+        update_interval=timedelta(seconds=15),
+    )
+    await coordinator.async_config_entry_first_refresh()
+    async_add_entities(
+        SolarSensor(coordinator, key) for key in coordinator.data
+        if "value" in coordinator.data[key]
+    )
+```
+
+!!!success Let the reader decide when to drop
+The reader task owns the stream, so it is the only thing that knows when the
+connection is really finished. It tears itself down on a closed peer, an RST,
+or `keepalive` of silence, and the handler above never has to call `close()`.
+
+A cancelled or timed-out request does **not** drop anything: the reader has
+already consumed whatever was on the wire, and the reply that turns up late
+is discarded by transaction id. So `connected` is meaningful — it goes False
+exactly when the connection is dead, which is what the `finally` above keys
+the backoff off.
+
+Keeping a connection that is still healthy is deliberate. An `EnvelopeError`,
+or a `ModbusError` raised under `on_error="raise"`, leaves the stream in sync,
+and tearing it down would cost a reconnect for nothing.
+!!!
+
+!!!warning Back off after a failure, do not just retry
+The ~75 s lockout in [Caveats](caveats.md#one-connection-at-a-time) means a
+naive 15-second retry loop spends its whole life being refused. The
+`retry_after` timestamp above keeps the coordinator honest: it keeps
+reporting the entities unavailable instead of opening a connection the
+dongle will reject anyway.
+
+The guard has to sit outside the `try`. If it is inside, every tick spent
+waiting raises `UpdateFailed` *and* runs the `finally`, which pushes the
+deadline another 75 s into the future each time — so a failure at startup
+would leave the integration unavailable until Home Assistant is reloaded.
+Outside, only a genuine attempt can move the deadline.
+
+Note what the backoff costs. If the lockout really does follow *any* dropped
+connection, then a single transient failure pins the entities unavailable for
+75 s. That is the safe assumption to make — but see the caveats for what is
+and is not actually known about the trigger.
+!!!
+
+!!!warning Do not block the coordinator
+`poll()` reads 34 ranges in sequence and takes on the order of a second on
+real hardware. That is fine for a 15-second `update_interval`, but avoid
+calling it from a hot path such as a state-change callback.
+!!!
+
+---
+
 ## Data types
 
 ### `DongleInfo`
@@ -186,13 +464,34 @@ The CRC16 of the serial, exposed for cross-checking.
 
 All are exported from the package root.
 
+Every protocol-level failure derives from `DongleError`, so one `except` is
+enough:
+
+```python
+try:
+    values = await dongle.poll()
+except DongleError as exc:
+    # refused accreditation, bad HMAC, Modbus exception, refused
+    # connection, timeout or a dropped socket -- all of them
+    print("dongle failed:", exc)
+```
+
 | Exception | Raised when |
 |---|---|
-| `DongleError` | Protocol-level failure — not connected, no reply, refused `Accredit`, truncated frame, connection closed. |
+| `DongleError` | **Base class** for every dongle failure — not connected, no reply, refused `Accredit`, truncated frame, connection closed, connection refused or timed out. |
 | `ModbusError` | The slave answered with a Modbus exception. Carries `code`, `slave`, and `fc`. |
 | `DongleNoDataError` | The dongle answered a bare `64 07 <status>` stub instead of a frame. Carries `status`. |
 | `EnvelopeError` | A frame failed authentication or could not be decrypted. |
-| `ValueError` | Invalid arguments, e.g. `count` outside `1..50`. |
+| `ValueError` | Invalid arguments, e.g. `count` outside `1..50`. Not a dongle failure — it means the call itself was wrong. |
+
+!!!success `ModbusError`, `DongleNoDataError` and `EnvelopeError` subclass `DongleError`
+`except DongleError` catches all of them, which matters for the async client
+in particular: an uncaught `EnvelopeError` would otherwise skip the
+connection cleanup and leave the socket open. Catch one on its own only when
+you need to tell them apart. `ValueError` is deliberately *not* a
+`DongleError`, since it is a programming mistake rather than the device
+misbehaving.
+!!!
 
 !!!warning `ModbusError` and `DongleNoDataError` are different failures
 A `DongleNoDataError` is a **dongle-level** refusal: it has no data for that

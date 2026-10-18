@@ -28,7 +28,7 @@ In Python, via `sitsolar_dongle.crypto.derive_keys`:
 ```python
 from sitsolar_dongle import derive_keys
 
-keys = derive_keys("300018101261010226")
+keys = derive_keys("<DONGLE_SERIAL>")
 keys.aes     # 16 bytes
 keys.hmac    # 16 bytes
 keys.crc     # CRC16 of the serial, for cross-checking
@@ -110,7 +110,7 @@ Used in exactly two places:
 ```python
 from sitsolar_dongle import crc16, crc16_bytes
 
-crc16(b"300018101261010226")        # int
+crc16(b"<DONGLE_SERIAL>")          # int
 crc16_bytes(b"\x01\x04\x75\x94")    # 2 bytes, big-endian, ready to append
 ```
 
@@ -150,18 +150,25 @@ vectors taken from the APK and from a live dongle.
 `DongleClient` seals a payload in two steps, because the outer header must
 survive in the clear while the protocol id is patched afterwards:
 
-1. `wrap_payload()` builds the plaintext frame: `tid | 0x0000 | length | unit | payload`.
+1. `wrap_payload()` builds the plaintext frame: `tid | protocol | length | unit | payload`.
 2. The 7-byte header is split off; the remaining payload is sealed.
-3. The header is re-prefixed to the envelope, then **byte 2 is patched to
-   `0x10`** (making protocol id `0x1000`) and the length field is recomputed as
-   `len(envelope) + 1`.
+3. The header is re-prefixed to the envelope, then the **protocol id is written
+   into bytes 2-3** (`0x1000` for requests, `0x1001` for heartbeat replies) and
+   the length field is recomputed as `len(envelope) + 1`.
+
+The official app reaches the same bytes by leaving the protocol id at `0x0000`
+and patching byte 2 to `0x10` only *after* encrypting. Writing both bytes up
+front is equivalent on the wire, and it is what lets requests and heartbeat
+replies share one function.
 
 ```python
-# from DongleClient._seal_frame
-header, payload = plain[:7], plain[7:]
-envelope = seal(payload, self.keys)
+# from sitsolar_dongle.session.seal_frame
+plain = wrap_payload(payload, tid, protocol)
+header, body = plain[:7], plain[7:]
+envelope = seal(body, keys)
 out = bytearray(header + envelope)
-out[2] = (PROTO_REQUEST >> 8) & 0xFF
+out[2] = (protocol >> 8) & 0xFF
+out[3] = protocol & 0xFF
 out[4] = (len(envelope) + 1) >> 8
 out[5] = (len(envelope) + 1) & 0xFF
 ```

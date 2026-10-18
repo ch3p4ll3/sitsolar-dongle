@@ -10,10 +10,23 @@ Typical use::
 
     from sitsolar_dongle import DongleClient
 
-    with DongleClient("192.168.1.50", "300018101261010226") as dongle:
+    with DongleClient("192.168.1.50", "<DONGLE_SERIAL>") as dongle:
         for key, reading in dongle.poll().items():
             if "value" in reading:
                 print(key, reading["value"], reading.get("unit", ""))
+
+For asyncio applications such as Home Assistant, use
+:class:`AsyncDongleClient` instead -- :class:`DongleClient` blocks the event
+loop it is called from::
+
+    from sitsolar_dongle import AsyncDongleClient
+
+    async with AsyncDongleClient("192.168.1.50", "<DONGLE_SERIAL>") as dongle:
+        values = await dongle.poll()
+
+Every failure -- refused accreditation, bad HMAC, Modbus exception, dropped
+connection or timeout -- is raised as :class:`DongleError`, so a single
+``except`` is enough to handle all of them.
 
 Only reads are implemented; nothing in this package ever writes to the
 inverter.
@@ -21,17 +34,20 @@ inverter.
 
 from __future__ import annotations
 
-from .client import DEFAULT_PORT, Device, DongleClient, DongleError, DongleInfo
+from .async_client import AsyncDongleClient
+from .client import DEFAULT_PORT, Device, DongleClient, DongleInfo
 from .crc import crc16, crc16_bytes
 from .crypto import EnvelopeError, Keys, derive_keys, open_envelope, seal
 from .decode import decode
+from .errors import DongleError
 from .framing import (MAX_REGISTERS, HEADER, DongleNoDataError, Frame,
                       ModbusError, build_read, parse_read_reply, wrap_payload)
 from .registers import REGISTERS, Register, blocks
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
+    "AsyncDongleClient",
     "DEFAULT_PORT",
     "Device",
     "DongleClient",
