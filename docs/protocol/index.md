@@ -168,10 +168,13 @@ do the same — you never see a heartbeat, and it never confuses a reply:
 
 That difference is not cosmetic. Measured against real hardware, the dongle
 **closes a connection whose heartbeats go unanswered** — about five missed
-pushes, or roughly three minutes — while a session that answers them stayed up
-for ten minutes. So the blocking client is viable at polling intervals
-shorter than the heartbeat period and no longer, whereas the async client does
-not care how long the caller stays quiet.
+pushes, or roughly three minutes — while a session that answered each push
+immediately stayed up for ten minutes. The async client therefore does not care
+how long the caller stays quiet.
+
+For the blocking client the same measurement implies an interval shorter than
+the heartbeat period, but does not prove it: it answers late rather than never,
+and whether the dongle treats those alike has not been tested.
 
 ```python
 # reply layout, built automatically

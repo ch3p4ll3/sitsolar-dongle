@@ -160,9 +160,9 @@ async with AsyncDongleClient("192.168.1.50", "<DONGLE_SERIAL>") as dongle:
     values = await dongle.poll()
 ```
 
-The constructor takes the same parameters as [`DongleClient`](#dongleclient)
-plus one of its own. Every method that touches the wire is a coroutine; the
-returned values, exceptions and `poll()` shape are identical.
+The constructor takes the same core parameters as [`DongleClient`](#dongleclient),
+plus two about the heartbeat. Every method that touches the wire is a
+coroutine; the returned values, exceptions and `poll()` shape are identical.
 
 | | Blocking | Async |
 |---|---|---|
@@ -175,15 +175,45 @@ returned values, exceptions and `poll()` shape are identical.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `keepalive` | `90.0` | Seconds the background reader may hear nothing at all before it concludes the peer is gone. Heartbeats arrive every ~37 s on a live link, so this is several missed pushes, not one slow reply. It exists for half-open connections that never send a FIN, which `readexactly` would otherwise block on forever. |
+| `heartbeat` | `37.0` | Seconds between the dongle's heartbeat pushes. Only used to derive `keepalive`. |
+| `keepalive` | `3 × heartbeat` | Seconds the background reader may hear nothing at all before it concludes the peer is gone. It exists for half-open connections that never send a FIN, which `readexactly` would otherwise block on forever. |
 
-`interframe` is accepted for symmetry with the blocking client but ignored:
-every request here gets exactly one reply, so there is no multi-frame gap to
-pace.
+!!!warning `heartbeat` is a measurement, not a protocol constant
+The 37 s figure was measured on one Si-Dongle-L. Nothing in the protocol
+documentation fixes that interval, and there is no command in this library to
+ask the dongle what it uses — so if your firmware pushes less often than every
+37 s, a healthy idle link would be declared dead roughly every `keepalive`
+seconds and reconnect in a loop.
+
+If you see that, set `heartbeat` to your dongle's real period and `keepalive`
+follows. `interframe` is accepted for symmetry with the blocking client but
+ignored here: every request gets exactly one reply, so there is no multi-frame
+gap to pace.
+!!!
 
 ### `connected -> bool`
 
 True while there is a live connection to the dongle.
+
+It goes False when the connection really is finished: the peer closed it, sent
+RST, said nothing for `keepalive`, **or ignored three requests in a row**. That
+last case matters — a dongle can finish the handshake and then never answer a
+read, which leaves the socket perfectly healthy and `connected` stuck on True.
+Three consecutive timeouts is what breaks the tie, so a client keying its
+reconnect off `connected` recovers rather than retrying a dead socket forever.
+A successful reply resets the count, so a merely busy inverter is not
+mistaken for a dead link.
+
+!!!danger Always `await close()`, or use `async with`
+The background reader keeps the client alive for as long as it is connected,
+so dropping the last reference does **not** free the connection the way it used
+to — the reader holds it open. The dongle serves one connection at a time, so a
+leaked client locks every other client out until the dongle is restarted.
+
+In a Home Assistant integration, `entry.async_on_unload(dongle.close)` is the
+one line that makes unloading safe. `close()` is bounded, so an unload cannot
+hang on a dead link.
+!!!
 
 ### How it differs from the blocking client
 
@@ -218,15 +248,16 @@ reconnect lockout that turned a routine cancellation into a 75 s outage.
 !!!
 
 !!!warning A dead connection drops itself
-When the reader concludes the connection is finished — the peer closed it,
-sent RST, or went silent — the connection is dropped, `connected` reports
-`False`, and any request waiting on it fails immediately instead of burning
-its full `timeout`. Reconnect with `await connect()`.
+When the reader concludes the connection is finished — the peer closed it, sent
+RST, said nothing for `keepalive`, or ignored three requests in a row — the
+connection is dropped, `connected` reports `False`, and any request waiting on
+it fails immediately instead of burning its full `timeout`. Reconnect with
+`await connect()`.
 
-Silence is judged by `keepalive` (90 s by default). Heartbeats arrive roughly
-every 37 s on a live link, so this is several missed pushes rather than one
-slow reply, and it exists for half-open connections that never send a FIN,
-which `readexactly` would otherwise block on forever.
+Silence is judged across *all* traffic, not just heartbeats, and defaults to
+three heartbeat periods — so it tolerates a couple of missed pushes while still
+catching a half-open connection that never sends a FIN, which `readexactly`
+would otherwise block on forever.
 !!!
 
 !!!info A bad envelope does *not* drop the connection
@@ -243,12 +274,23 @@ The dongle pushes a heartbeat roughly every 37 s. A background task owns the
 connection and replies the moment one arrives, exactly as the official app
 does, so your polling interval has no bearing on whether the session survives.
 
-This is measured, not assumed. Against real hardware a session that left
-heartbeats unanswered was **dropped by the dongle** after about five missed
-pushes — roughly three minutes — while an identical session that answered them
-stayed up for ten minutes and polled normally throughout. Answering only
-during reads is therefore viable for about three minutes and no longer, which
-is why this client does not do it.
+This is measured, not assumed — for the case it tested. Against real hardware a
+session that left heartbeats unanswered was **dropped by the dongle** after
+about five missed pushes — roughly three minutes — while an identical session
+that answered each push immediately stayed up for ten minutes and polled
+normally throughout.
+
+!!!question What was *not* measured
+The probe compared "never answer" against "answer immediately". The blocking
+client sits between those: it lets pushes queue and answers them in a burst at
+the next read, which is late rather than never. Whether the dongle counts a
+late answer the same as a prompt one has **not** been tested, so the advice to
+keep the blocking client's polling interval under the heartbeat period is a
+reasonable guess from the mechanism, not a finding.
+
+`tools/hw_probe.py` is in the repository; a third mode that drains queued
+pushes on a timer would settle it.
+!!!
 
 The consequences for you: a long-lived connection is safe at any polling
 interval, reconnecting per poll is unnecessary, and the gap between roughly
@@ -287,6 +329,12 @@ RECONNECT_AFTER = 75.0
 async def async_setup_entry(hass, entry, async_add_entities):
     dongle = AsyncDongleClient(entry.data["host"], entry.data["serial"],
                                timeout=10.0)
+    # Always close.  The client runs a background reader for as long as it is
+    # connected, and that reader keeps the client alive -- so a client left to
+    # the garbage collector holds its connection open, and the dongle serves
+    # only one connection at a time.  Reloading this entry without closing
+    # would lock every other client out until the dongle is restarted.
+    entry.async_on_unload(dongle.close)
     state = {"retry_after": 0.0}
 
     async def async_update():
@@ -304,14 +352,15 @@ async def async_setup_entry(hass, entry, async_add_entities):
         except DongleError as exc:
             raise UpdateFailed(str(exc)) from exc
         finally:
-            # `connected` only goes False when the reader concludes the
-            # connection is finished: the peer closed it, sent RST, or went
-            # silent for `keepalive`.  A cancelled or timed-out request
-            # leaves it True, so this arms the backoff for a genuinely dead
-            # connection and not for a slow one.  It is also why close() is
-            # not called above -- an EnvelopeError or a ModbusError raised
-            # under on_error="raise" leaves a healthy socket worth keeping,
-            # and `connected` stays True so no backoff is set.
+            # `connected` only goes False when the connection really is
+            # finished: the peer closed it, sent RST, went silent for
+            # `keepalive`, or ignored three requests in a row.  A cancelled
+            # or merely slow request leaves it True, so this arms the
+            # backoff for a genuinely dead connection and not for a slow
+            # one.  It is also why close() is not called above -- an
+            # EnvelopeError or a ModbusError raised under on_error="raise"
+            # leaves a healthy socket worth keeping, and `connected` stays
+            # True so no backoff is set.
             if not dongle.connected:
                 state["retry_after"] = time.monotonic() + RECONNECT_AFTER
 

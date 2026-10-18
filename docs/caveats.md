@@ -32,11 +32,15 @@ back off rather than retry on the next tick.
 
 One *drop* trigger is now pinned down, though. Against real hardware a session
 that left heartbeats unanswered was closed by the dongle after about five
-missed pushes — roughly three minutes — while an identical session that answered
-them stayed up for ten minutes. `AsyncDongleClient` answers them from its
-background reader, which removes that failure mode entirely; `DongleClient`
-only answers during a read, so keep its polling interval shorter than the ~37 s
-heartbeat period.
+missed pushes — roughly three minutes — while an identical session that
+answered each push *immediately* stayed up for ten minutes.
+
+What was not tested is whether a late answer counts: the blocking client lets
+pushes queue and answers them in a burst at the next read, which sits between
+"never" and "immediately". So the advice to keep its polling interval under the
+~37 s heartbeat period is a sound guess from that mechanism, not a measurement.
+`AsyncDongleClient` is unaffected either way — its background reader answers
+pushes the moment they arrive.
 
 | Do | Don't |
 |---|---|

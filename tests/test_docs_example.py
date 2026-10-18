@@ -67,12 +67,13 @@ class FakeClient:
     are modelled separately, because the documented example treats them
     differently:
 
-    * ``failing`` -- a timeout.  The stream broke, so the socket is dropped
-      and ``DongleError`` is raised; the ``finally`` arms the backoff.
-    * ``cancellable`` -- a caller cancels mid-poll.  The real client drops the
-      connection from ``_take()`` before the ``CancelledError`` escapes, so no
-      ``except DongleError`` ever sees it.  This is the case that makes the
-      ``finally`` necessary at all.
+    * ``failing`` -- the dongle is gone.  The reader declares the connection
+      lost, ``connected`` goes False and ``DongleError`` is raised, so the
+      ``finally`` arms the backoff.
+    * ``cancellable`` -- a caller cancels mid-poll.  The reader owns the
+      stream, so cancelling only abandons that request and the connection
+      survives.  This is the case that proves a cancellation is *not* worth a
+      75 s lockout.
     * ``healthy_error`` -- an error on a socket that stayed in sync, such as a
       ``ModbusError`` under ``on_error="raise"``.  ``connected`` stays True,
       so no backoff is armed.
@@ -89,6 +90,7 @@ class FakeClient:
         self.connected = False
         self.connect_calls = 0
         self.poll_calls = 0
+        self.close_calls = 0
         self.failing = False
         self.cancellable = False
         self.healthy_error = False
@@ -106,16 +108,18 @@ class FakeClient:
             try:
                 await asyncio.Event().wait()      # never set: only cancel ends it
             except BaseException:
-                self.connected = False            # _take() drops on cancellation
+                # the reader owns the stream, so the connection survives a
+                # cancelled request and the next poll reuses the socket
                 raise
         if self.healthy_error:
             raise DongleError("modbus exception code 1")   # socket kept
         if self.failing or not self.reachable:
-            self.connected = False          # a timeout drops the connection
+            self.connected = False          # the connection is finished
             raise DongleError("timed out waiting for a reply")
         return {"grid_frequency": {"value": 50.0}}
 
     async def close(self) -> None:
+        self.close_calls += 1
         self.connected = False
 
 
@@ -149,7 +153,17 @@ class Coordinator:
 
 
 class Entry:
+    """Minimal config entry: enough of the unload-hook surface for the docs."""
+
     data = {"host": "192.0.2.1", "serial": "TESTDONGLE0000001"}
+    instances: list["Entry"] = []
+
+    def __init__(self) -> None:
+        self.unloaders: list = []
+        type(self).instances.append(self)
+
+    def async_on_unload(self, func) -> None:
+        self.unloaders.append(func)
 
 
 class Sensor:
@@ -166,6 +180,7 @@ def build(monkeypatch):
         FakeClient.instances = []
         FakeClient.default_reachable = reachable
         Coordinator.instances = []
+        Entry.instances = []
 
         helpers = types.ModuleType("homeassistant.helpers")
         helpers.__path__ = []                # type: ignore[attr-defined]
@@ -302,15 +317,18 @@ def test_successful_polls_never_set_a_backoff(build):
     assert all(o[1]["grid_frequency"]["value"] == 50.0 for o in outcomes)
 
 
-def test_cancelled_poll_sets_a_backoff(build):
-    """A cancelled poll backs off, though it never raises ``DongleError``.
+def test_cancelled_poll_does_not_set_a_backoff(build):
+    """A cancelled poll leaves the connection usable, so it gets no backoff.
 
-    This is the case the ``finally`` exists for.  A caller wrapping
-    ``poll()`` in ``asyncio.timeout`` is the normal Home Assistant pattern;
-    the client drops the connection from inside ``_take()``, so no
-    ``except DongleError`` runs and only a check in a ``finally`` can arm the
-    backoff.  Without it the next tick would reconnect straight into the
-    lockout.
+    The client reads through a background reader now, so cancelling ``poll()``
+    only abandons that request: the connection survives and the next tick
+    retries on the same socket.  Arming the 75 s lockout for a routine
+    cancellation would cost far more than the cancellation it was meant to
+    protect against.
+
+    The ``finally`` is still load-bearing — it arms the backoff when the
+    reader declares the connection dead, which
+    ``test_backoff_stops_waiting_and_reconnects`` covers.
     """
     clock = Clock(1000.0)
 
@@ -330,21 +348,44 @@ def test_cancelled_poll_sets_a_backoff(build):
         task.cancel()                      # what asyncio.timeout would do
         with pytest.raises(asyncio.CancelledError):
             await task
-        dropped = not client.connected
+        survived = client.connected
 
-        client.cancellable = False         # dongle is healthy again
-        waiting = await tick(update, clock)
-        calls_after_cancel = client.connect_calls
-        later = await tick(update, clock, times=6)
-        return client, dropped, waiting, calls_after_cancel, later
+        client.cancellable = False
+        next_tick = await tick(update, clock)
+        return client, survived, next_tick
 
-    client, dropped, waiting, calls_after_cancel, later = asyncio.run(run())
+    client, survived, next_tick = asyncio.run(run())
 
-    assert dropped, "the client must drop a connection torn by cancellation"
-    assert waiting[0][0] == "waiting", "no backoff was armed for the cancel"
-    assert calls_after_cancel == 1, "reconnected on the tick right after a cancel"
-    assert any(o[0] == "ok" for o in later), "backoff never expired"
-    assert client.connect_calls == 2, "never reconnected after the cancellation"
+    assert survived, "a cancelled request must not cost the connection"
+    assert next_tick[0][0] == "ok", "backed off after a mere cancellation"
+    assert client.connect_calls == 1, \
+        "a cancellation should not have needed a reconnect"
+
+
+def test_the_documented_example_closes_on_unload(build):
+    """The example closes the client, or reloading the entry locks the dongle out.
+
+    The reader task keeps its client alive, so a client left to the garbage
+    collector holds its connection open — and the dongle serves one connection
+    at a time, so a leaked client locks every other client out until the
+    dongle is restarted.  ``async_on_unload`` is what stops that.
+    """
+    clock = Clock(1000.0)
+
+    async def run():
+        update, client = await build(clock)
+        assert client.connected
+        entry = Entry.instances[-1]
+        for closer in entry.unloaders:
+            result = closer()
+            if asyncio.iscoroutine(result):
+                await result
+        return client
+
+    client = asyncio.run(run())
+
+    assert client.close_calls == 1, "unload never closed the client"
+    assert not client.connected, "unload must leave the connection closed"
 
 
 def test_a_healthy_connection_is_not_backed_off(build):

@@ -18,9 +18,13 @@ the same rather than letting the pushes pile up.
 Unlike the asyncio client, there is no background reader here: a heartbeat is
 only answered while a read is in flight, so between polls it sits in the TCP
 buffer.  Measured against real hardware the dongle **closes a connection whose
-heartbeats go unanswered**, dropping a silent client after roughly five missed
-pushes -- about three minutes.  Keep polling more often than the ~37 s
-heartbeat period, or use
+heartbeats go unanswered**, dropping a client that never answers after roughly
+five missed pushes -- about three minutes -- while one that answered each push
+immediately stayed up for ten minutes.
+
+This client answers late rather than never, and whether the dongle counts those
+alike has not been tested, so keeping the polling interval under the ~37 s
+heartbeat period is a sound guess rather than a finding.  Alternatively use
 :class:`sitsolar_dongle.async_client.AsyncDongleClient`, whose reader task
 answers pushes immediately however long the caller stays quiet.
 

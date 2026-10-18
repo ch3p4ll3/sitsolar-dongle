@@ -9,18 +9,26 @@ Two experiments exist, because two claims in the documentation rest on
 observations nobody has tested systematically:
 
 ``idle``
-    Does the dongle keep a connection open for a client that says nothing?
-    The client answers heartbeats only while a request is in flight, so
-    between polls the pushes accumulate in the TCP buffer.  Whether the
-    dongle tolerates that -- for minutes, or at all -- is unmeasured, and it
-    is what the "keep intervals at or below 30 s" advice rests on.
+    Does the dongle keep a connection open for a client that answers
+    heartbeats late, or only for one that answers them at once?
 
-    Runs each idle duration twice: once with the connection left alone
-    (``--mode passive``, what the library does today) and once with a pump
-    answering every heartbeat the moment it arrives (``--mode pumped``, what
-    a background reader task would do).  If passive fails and pumped
-    survives, the reader task is *needed*.  If both survive, it is a
-    nice-to-have.  If both fail, something else is wrong.
+    The probe owns its transport rather than using ``AsyncDongleClient``,
+    because that client answers heartbeats from a background reader of its
+    own -- using it here would only ever re-demonstrate that the reader
+    works.  Three answer policies are swept instead:
+
+    ``--mode passive``
+        Never answer.  The dongle is measured to drop this after roughly five
+        unanswered pushes.
+    ``--mode immediate``
+        Answer the instant one arrives.  Measured to survive ten minutes.
+    ``--mode burst``
+        Queue them and drain every ``--burst`` seconds -- what the blocking
+        client does in effect, and the one case no measurement covers.
+        ``passive`` and ``immediate`` bracket the answer, so running burst
+        between them is what would settle whether a *late* reply counts.
+
+    ``--mode both`` is passive+immediate.
 
 ``lockout``
     What triggers the ~75 s window in which the dongle refuses new
@@ -30,18 +38,24 @@ observations nobody has tested systematically:
     down.  Sweeps teardown style against reconnect gap.
 
 Usage:
-    # how long can it sit idle, and does answering help?
-    python tools/hw_probe.py idle --host 192.168.1.50 --sn <DONGLE_SERIAL>
+    # how long can it sit idle, and does answering at once help?
+    python tools/hw_probe.py --host 192.168.1.50 --sn-file ./sn idle
+
+    # does a *late* answer count?  drain every 30 s, between the two
+    # known outcomes
+    python tools/hw_probe.py --host 192.168.1.50 --sn-file ./sn idle \\
+        --mode burst --burst 30 --seconds 300
 
     # what makes it stop accepting connections?
-    python tools/hw_probe.py lockout --host 192.168.1.50 --sn <DONGLE_SERIAL>
+    python tools/hw_probe.py --host 192.168.1.50 --sn-file ./sn lockout
 
     # one pair at a time, so trials cannot contaminate each other
-    python tools/hw_probe.py lockout --host ... --sn ... \\
+    python tools/hw_probe.py --host ... --sn-file ./sn lockout \\
         --teardown rst --gaps 20 --no-matrix
 
 The serial is a credential: both session keys are derived from it.  It is
-accepted as an argument or via ``--sn-file``, never hard-coded here.
+accepted as an argument or via ``--sn-file``, never hard-coded here -- and
+``--sn`` lands in your shell history, so prefer the file.
 """
 
 from __future__ import annotations
@@ -57,7 +71,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from sitsolar_dongle import AsyncDongleClient, DongleError  # noqa: E402
-from sitsolar_dongle.framing import Frame, parse_header  # noqa: E402
+from sitsolar_dongle.crypto import derive_keys, open_envelope  # noqa: E402
+from sitsolar_dongle.framing import (  # noqa: E402
+    Frame,
+    PROTO_PUSH,
+    build_read,
+    parse_header,
+    parse_read_reply,
+)
+from sitsolar_dongle.session import (  # noqa: E402
+    CMD_ACCREDIT,
+    CMD_BEFORE_ACCREDIT,
+    CMD_HEARTBEAT,
+    DEFAULT_PORT,
+    PROTO_HEARTBEAT_REPLY,
+    parse_dongle_info,
+    seal_frame,
+)
 
 # A heartbeat arrives roughly every 37 s in the captures this was written
 # from.  Anything well beyond that without a byte is worth calling out.
@@ -77,16 +107,15 @@ def describe(exc: BaseException) -> str:
     return "%s: %s" % (type(exc).__name__, exc)
 
 
-def raw_socket(client: AsyncDongleClient) -> socket.socket | None:
-    """The transport's socket, for teardown tricks the client cannot do."""
-    writer = client._writer          # noqa: SLF001 - this is a probe script
+def raw_socket(writer) -> socket.socket | None:
+    """The transport's socket, for teardown tricks the session cannot do."""
     if writer is None:
         return None
     return writer.get_extra_info("socket")
 
 
-def pending_frames(client: AsyncDongleClient) -> list[tuple[int, int]]:
-    """Frames the client has buffered but not yet consumed.
+def pending_frames(reader: asyncio.StreamReader) -> list[tuple[int, int]]:
+    """Frames that have arrived but not yet been consumed.
 
     ``StreamReader`` reads eagerly off the transport, so the bytes pile up in
     its internal buffer rather than in the kernel socket buffer -- peeking at
@@ -95,9 +124,6 @@ def pending_frames(client: AsyncDongleClient) -> list[tuple[int, int]]:
     which matters here because consuming it would answer the heartbeats and
     spoil the very measurement being taken.
     """
-    reader = client._reader          # noqa: SLF001
-    if reader is None:
-        return []
     buf: bytearray = reader._buffer          # noqa: SLF001
     out: list[tuple[int, int]] = []
     offset = 0
@@ -111,86 +137,215 @@ def pending_frames(client: AsyncDongleClient) -> list[tuple[int, int]]:
     return out
 
 
-async def pump_heartbeats(client: AsyncDongleClient, stop: asyncio.Event,
-                          counter: dict[str, int]) -> None:
-    """Answer heartbeats the moment they arrive, as a reader task would.
+class RawSession:
+    """A connection the probe drives itself, frame by frame.
 
-    Only safe while *no* request is in flight: it consumes whatever it reads.
-    A non-push frame during a pure idle window would mean the dongle
+    The library's own client answers heartbeats from a background reader, so
+    using it here would make the experiment circular: it could only ever show
+    that answering heartbeats works.  Owning the transport is what lets the
+    answer policy be the thing under test instead.
+    """
+
+    def __init__(self, reader: asyncio.StreamReader,
+                 writer: asyncio.StreamWriter, keys) -> None:
+        self.reader = reader
+        self.writer = writer
+        self.keys = keys
+        self._tid = 0
+
+    @classmethod
+    async def open(cls, host: str, port: int, serial: str,
+                   timeout: float) -> RawSession:
+        """Connect and run the same handshake the library does."""
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout)
+        session = cls(reader, writer, derive_keys(serial))
+        try:
+            await session._handshake(timeout)
+        except (DongleError, OSError, asyncio.TimeoutError):
+            writer.close()
+            raise
+        return session
+
+    def _next_tid(self) -> int:
+        self._tid = (self._tid + 1) & 0xFFFF
+        return self._tid
+
+    async def send(self, payload: bytes) -> int:
+        """Seal and write one command; returns the transaction id used."""
+        tid = self._next_tid()
+        self.writer.write(seal_frame(payload, self.keys, tid=tid))
+        await self.writer.drain()
+        return tid
+
+    async def read_frame(self, timeout: float) -> Frame:
+        """One whole frame, or raise.  ``TimeoutError`` means nothing came."""
+        header = await asyncio.wait_for(self.reader.readexactly(7), timeout)
+        tid, protocol, length, unit = parse_header(header)
+        envelope = await self.reader.readexactly(length - 1)
+        return Frame(tid=tid, protocol=protocol, unit=unit, envelope=envelope)
+
+    async def payload_of(self, frame: Frame) -> bytes:
+        return open_envelope(frame.envelope, self.keys)
+
+    async def _handshake(self, timeout: float) -> None:
+        await self.send(CMD_BEFORE_ACCREDIT)
+        parse_dongle_info(await self.payload_of(await self.read_frame(timeout)))
+        await self.send(CMD_ACCREDIT)
+        payload = await self.payload_of(await self.read_frame(timeout))
+        if len(payload) > 2 and payload[2] != 0:
+            raise DongleError("Accredit refused with result 0x%02X"
+                              % payload[2])
+
+    async def answer(self, frame: Frame) -> None:
+        """Reply to a heartbeat exactly as the official app does.
+
+        The push's transaction id is reused, so the dongle can tell an answer
+        from a fresh command -- answering with a new tid would be a different
+        experiment from the one the app performs.
+        """
+        stamp = struct.pack(">I", int(time.time()) & 0xFFFFFFFF)
+        self.writer.write(seal_frame(
+            CMD_HEARTBEAT + stamp, self.keys, tid=frame.tid,
+            protocol=PROTO_HEARTBEAT_REPLY))
+        await self.writer.drain()
+
+    async def poll(self, timeout: float) -> int:
+        """One register block, as proof the link still works.  Returns words."""
+        await self.send(build_read(1, 31000, 40))
+        reply = parse_read_reply(
+            await self.payload_of(await self.read_frame(timeout)))
+        return len(reply.registers)
+
+    async def close(self) -> None:
+        try:
+            self.writer.close()
+        except OSError:
+            pass
+
+
+async def answer_pushes(session: RawSession, policy: str, period: float,
+                        stop: asyncio.Event, counter: dict[str, int]) -> None:
+    """Consume incoming frames and answer heartbeats according to *policy*.
+
+    ``passive``
+        Never answer.  This is the failure mode the docs used to describe and
+        the one the dongle is measured to punish.
+    ``immediate``
+        Answer the instant one arrives -- what a background reader does, and
+        what the official app does.
+    ``burst``
+        Queue them and drain every *period* seconds.  This is what the
+        blocking client does in effect, and it is the case the hardware
+        measurement has never covered: whether a *late* answer counts the
+        same as a prompt one.  Run it with ``--burst`` set near the heartbeat
+        period to bracket the answer.
+
+    Only safe while *no* request is in flight, because it consumes whatever it
+    reads.  A non-push frame during a pure idle window would mean the dongle
     volunteered something unsolicited, which would itself be a finding -- it
     is counted rather than silently swallowed.
 
-    The connection is dropped if the pump ever leaves mid-frame, which is the
-    one way this can go wrong.  ``readexactly`` only removes bytes once it
-    has a complete read, so cancelling it while waiting for a header is
-    harmless -- but cancelling after the header is in and before the body is
-    would leave the stream torn, and the poll that follows would then fail
-    for reasons that have nothing to do with what is being measured.
+    The connection is dropped if this ever leaves mid-frame.  ``readexactly``
+    only removes bytes once it has a complete read, so cancelling it while
+    waiting for a header is harmless -- but cancelling after the header is in
+    and before the body would leave the stream torn, and the poll that follows
+    would then fail for reasons that have nothing to do with what is being
+    measured.
     """
-    reader = client._reader          # noqa: SLF001
+    reader = session.reader
+    queue: list[Frame] = []
     mid_frame = False
+    next_drain = time.monotonic() + period
     try:
-        while not stop.is_set() and reader is not None:
+        while not stop.is_set():
             try:
-                header = await asyncio.wait_for(reader.readexactly(7), 0.5)
+                header = await asyncio.wait_for(reader.readexactly(7), 0.25)
             except asyncio.TimeoutError:
-                continue                        # no frame has started
+                header = None
             except (asyncio.IncompleteReadError, ConnectionError, OSError):
                 counter["closed"] += 1
                 return
-            # a frame has started; from here an abort tears the stream
-            mid_frame = True
-            try:
-                tid, protocol, length, unit = parse_header(header)
-                envelope = await reader.readexactly(length - 1)
-            except (asyncio.IncompleteReadError, ConnectionError, OSError):
-                counter["closed"] += 1
-                return
-            mid_frame = False
-            frame = Frame(tid=tid, protocol=protocol, unit=unit,
-                          envelope=envelope)
-            if not frame.is_push:
-                counter["unsolicited_non_push"] += 1
-                continue
-            counter["answered"] += 1
-            try:
-                await client._answer_push(frame)   # noqa: SLF001
-            except (ConnectionError, OSError):
-                counter["closed"] += 1
-                return
+
+            if header is not None:
+                # a frame has started; from here an abort tears the stream
+                mid_frame = True
+                try:
+                    tid, protocol, length, unit = parse_header(header)
+                    envelope = await reader.readexactly(length - 1)
+                except (asyncio.IncompleteReadError, ConnectionError, OSError):
+                    counter["closed"] += 1
+                    return
+                mid_frame = False
+                frame = Frame(tid=tid, protocol=protocol, unit=unit,
+                              envelope=envelope)
+                if not frame.is_push:
+                    counter["unsolicited_non_push"] += 1
+                else:
+                    counter["queued"] += 1
+                    if policy == "passive":
+                        pass                       # the point of the mode
+                    elif policy == "immediate":
+                        counter["answered"] += 1
+                        await _try_answer(session, frame, counter)
+                    else:                          # burst
+                        queue.append(frame)
+
+            if policy == "burst" and time.monotonic() >= next_drain:
+                next_drain = time.monotonic() + period
+                for queued in queue:
+                    counter["answered"] += 1
+                    await _try_answer(session, queued, counter)
+                queue.clear()
     finally:
         if mid_frame:
             counter["desync"] += 1
-            client._drop()                          # noqa: SLF001
+            await session.close()
+        elif policy == "burst" and queue:
+            # a real client answers what it queued at its next poll, so
+            # draining here keeps the comparison honest rather than
+            # crediting burst mode with answers it never got to send
+            for queued in queue:
+                counter["answered"] += 1
+                await _try_answer(session, queued, counter)
+
+
+async def _try_answer(session: RawSession, frame: Frame,
+                      counter: dict[str, int]) -> None:
+    try:
+        await session.answer(frame)
+    except (ConnectionError, OSError):
+        counter["closed"] += 1
 
 
 async def idle_once(host: str, serial: str, port: int, seconds: float,
-                    mode: str, timeout: float, sample: float) -> dict:
+                    mode: str, timeout: float, sample: float,
+                    burst: float) -> dict:
     """One idle run: connect, say nothing, then poll."""
     result: dict = {"seconds": seconds, "mode": mode}
-    client = AsyncDongleClient(host, serial, port=port, timeout=timeout)
     stop = asyncio.Event()
-    counter = {"answered": 0, "closed": 0, "unsolicited_non_push": 0,
-               "desync": 0}
+    counter = {"answered": 0, "closed": 0, "queued": 0,
+               "unsolicited_non_push": 0, "desync": 0}
+    session: RawSession | None = None
     task: asyncio.Task | None = None
 
     try:
         started = time.monotonic()
-        info = await client.connect()
+        session = await RawSession.open(host, port, serial, timeout)
         result["connect_s"] = time.monotonic() - started
-        result["serial"] = info.serial
         log("connected, idling %.0f s (%s)" % (seconds, mode))
 
-        if mode == "pumped":
-            task = asyncio.create_task(pump_heartbeats(client, stop, counter))
+        task = asyncio.create_task(answer_pushes(
+            session, mode, burst, stop, counter))
 
         peak = 0
         first_byte_at: float | None = None
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             await asyncio.sleep(min(sample, max(0.1, deadline - time.monotonic())))
-            backlog = pending_frames(client)
-            pushes = sum(1 for _tid, proto in backlog if (proto & 0xFF) == 1)
+            backlog = pending_frames(session.reader)
+            pushes = sum(1 for _tid, proto in backlog
+                         if (proto & 0xFF) == (PROTO_PUSH & 0xFF))
             peak = max(peak, len(backlog))
             if backlog and first_byte_at is None:
                 first_byte_at = time.monotonic()
@@ -198,28 +353,25 @@ async def idle_once(host: str, serial: str, port: int, seconds: float,
                 % (seconds - (deadline - time.monotonic()), len(backlog), pushes))
 
         result["peak_buffered"] = peak
-        result["backlog"] = len(pending_frames(client))
+        result["backlog"] = len(pending_frames(session.reader))
         result["first_byte_s"] = (None if first_byte_at is None
                                   else first_byte_at - (deadline - seconds))
-        result["connected_after_idle"] = client.connected
 
-        if task is not None:
-            stop.set()
-            try:
-                await asyncio.wait_for(task, 3.0)
-            except asyncio.TimeoutError:
-                task.cancel()
+        stop.set()
+        try:
+            await asyncio.wait_for(task, 3.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         result.update(counter)
 
-        if not client.connected:
+        if counter["closed"]:
             result["verdict"] = "CONNECTION DROPPED DURING IDLE"
             return result
 
         started = time.monotonic()
-        values = await client.poll()
+        result["values"] = await session.poll(timeout)
         result["poll_s"] = time.monotonic() - started
-        result["values"] = sum(1 for v in values.values()
-                               if isinstance(v, dict) and "value" in v)
         result["verdict"] = "SURVIVED"
         return result
     except DongleError as exc:
@@ -232,10 +384,8 @@ async def idle_once(host: str, serial: str, port: int, seconds: float,
         if task is not None:
             stop.set()
             task.cancel()
-        try:
-            await client.close()
-        except (DongleError, OSError):
-            pass
+        if session is not None:
+            await session.close()
 
 
 def report_idle(rows: list[dict]) -> None:
@@ -243,16 +393,22 @@ def report_idle(rows: list[dict]) -> None:
     print("=" * 78)
     print("IDLE TOLERANCE")
     print("=" * 78)
-    print("%8s %-8s %-9s %-9s %-8s %s"
-          % ("idle s", "mode", "backlog", "answered", "poll s", "verdict"))
+    print("%8s %-9s %-8s %-8s %-8s %-8s %s"
+          % ("idle s", "mode", "queued", "answer", "backlog", "poll s",
+             "verdict"))
     print("-" * 78)
     for row in rows:
-        print("%8.0f %-8s %-9s %-9s %-8s %s"
+        print("%8.0f %-9s %-8s %-8s %-8s %-8s %s"
               % (row["seconds"], row["mode"],
-                 row.get("backlog", "-"),
+                 row.get("queued", "-"),
                  row.get("answered", "-"),
+                 row.get("backlog", "-"),
                  "%.2f" % row["poll_s"] if "poll_s" in row else "-",
                  row["verdict"]))
+    print()
+    print("queued = pushes seen, answered = replies written.  A passive run")
+    print("should show a growing queue and zero answers; if the dongle drops")
+    print("it at some queue depth, that depth is how many it tolerates.")
     print()
     anomalies = [(r, k) for r in rows for k in
                  ("unsolicited_non_push", "desync") if r.get(k)]
@@ -274,7 +430,7 @@ def report_idle(rows: list[dict]) -> None:
 async def teardown(client: AsyncDongleClient, style: str,
                    abandoned: list[socket.socket]) -> str:
     """Close the connection in a chosen way; returns what was done."""
-    sock = raw_socket(client)
+    sock = raw_socket(client._writer)      # noqa: SLF001 - this is a probe
     if style == "rst" and sock is not None:
         # SO_LINGER with a zero timeout makes close() emit RST instead of FIN:
         # the abrupt teardown of a crashed client, or a peer that vanished.
@@ -417,8 +573,16 @@ def build_parser() -> argparse.ArgumentParser:
                           help="how long can the connection sit unused")
     idle.add_argument("--seconds", default="60,300,900",
                       help="comma separated idle durations, seconds")
-    idle.add_argument("--mode", choices=["passive", "pumped", "both"],
-                      default="both")
+    idle.add_argument("--mode", choices=["passive", "immediate", "burst",
+                                         "both"],
+                      default="both",
+                      help="answer policy: never answer, answer at once, or "
+                           "queue and drain every --burst seconds. "
+                           "'both' is passive+immediate")
+    idle.add_argument("--burst", type=float, default=HEARTBEAT_PERIOD,
+                      help="seconds between drains in burst mode; try a "
+                           "value near the heartbeat period to bracket "
+                           "whether late answers count")
     idle.add_argument("--sample", type=float, default=5.0,
                       help="seconds between backlog samples")
 
@@ -447,7 +611,7 @@ def apply_defaults(args: argparse.Namespace) -> argparse.Namespace:
     to happen.
     """
     fallbacks = {"host": None, "sn": None, "sn_file": None,
-                 "port": 7078, "timeout": 15.0}
+                 "port": DEFAULT_PORT, "timeout": 15.0}
     for name, value in fallbacks.items():
         if not hasattr(args, name):
             setattr(args, name, value)
@@ -461,9 +625,12 @@ def main() -> int:
     if not args.host:
         parser.error("--host is required (before or after the subcommand)")
     serial = load_serial(args)
-    modes = ["passive", "pumped"] if args.mode == "both" else [args.mode]
 
     if args.command == "idle":
+        # --mode belongs to this subcommand alone, so it is read here rather
+        # than next to the shared options: lockout does not define it
+        modes = (["passive", "immediate"] if args.mode == "both"
+                 else [args.mode])
         durations = [float(x) for x in args.seconds.split(",") if x.strip()]
         print("idle probe: %d run(s), total ~%.0f s\n"
               % (len(durations) * len(modes),
@@ -473,7 +640,7 @@ def main() -> int:
             for mode in modes:
                 rows.append(asyncio.run(idle_once(
                     args.host, serial, args.port, seconds, mode,
-                    args.timeout, args.sample)))
+                    args.timeout, args.sample, args.burst)))
         report_idle(rows)
         return 0
 

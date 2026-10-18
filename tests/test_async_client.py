@@ -10,12 +10,15 @@ frames the client sends, and answers ``BeforeAccredit``/``Accredit``/
 from __future__ import annotations
 
 import asyncio
+import gc
 import struct
 import time
+import weakref
 
 import pytest
 
 from sitsolar_dongle import AsyncDongleClient, DongleError
+from sitsolar_dongle.async_client import MAX_CONSECUTIVE_TIMEOUTS
 from sitsolar_dongle.crc import crc16_bytes
 from sitsolar_dongle.crypto import EnvelopeError, derive_keys, open_envelope
 from sitsolar_dongle.framing import HEADER, PROTO_PUSH, parse_header
@@ -529,6 +532,87 @@ def test_reconnect_after_the_reader_dies() -> None:
             assert info.serial == SERIAL
             assert await client.read(31002, 2) == (0, 0)
             await client.close()
+
+    asyncio.run(main())
+
+
+def test_consecutive_timeouts_drop_the_connection() -> None:
+    """A dongle that stops answering is reclaimed, not retried forever.
+
+    The keepalive only sees total *silence*, so a dongle that completes the
+    handshake and then ignores reads stays "connected" for as long as the
+    socket is. Nothing else would ever reconnect it — which is how an
+    integration ends up retrying the same dead socket on every tick.
+    """
+    async def main() -> None:
+        async with FakeDongle(ignore_reads=True) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port, timeout=0.2,
+                                         keepalive=30.0) as client:
+                for attempt in range(MAX_CONSECUTIVE_TIMEOUTS):
+                    with pytest.raises(DongleError, match="timed out"):
+                        await client.read(31002, 2)
+                    if attempt < MAX_CONSECUTIVE_TIMEOUTS - 1:
+                        assert client.connected, \
+                            "a lone timeout must not cost the connection"
+
+                assert not client.connected
+                # the reason is reachable now, not a bare "not connected"
+                with pytest.raises(DongleError, match="stopped answering"):
+                    await client.read(31002, 2)
+
+    asyncio.run(main())
+
+
+def test_a_successful_reply_resets_the_timeout_streak() -> None:
+    """Two timeouts and a success is not three timeouts.
+
+    A busy inverter can miss a beat, so only a run of failures in a row says
+    the connection is finished.
+    """
+    async def main() -> None:
+        async with FakeDongle(ignore_reads=True) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port, timeout=0.2,
+                                         keepalive=30.0) as client:
+                for _ in range(MAX_CONSECUTIVE_TIMEOUTS - 1):
+                    with pytest.raises(DongleError, match="timed out"):
+                        await client.read(31002, 2)
+
+                dongle.ignore_reads = False
+                assert await client.read(31002, 2) == (0, 0)
+
+                dongle.ignore_reads = True
+                for _ in range(MAX_CONSECUTIVE_TIMEOUTS - 1):
+                    with pytest.raises(DongleError, match="timed out"):
+                        await client.read(31002, 2)
+                assert client.connected, "the streak should have been reset"
+
+    asyncio.run(main())
+
+
+def test_a_dropped_client_is_collected_and_hangs_up() -> None:
+    """A client dropped without close() does not hold its connection forever.
+
+    The reader task used to keep its client alive, so an integration that
+    reloaded without closing pinned the socket — and the dongle serves one
+    connection at a time, so that locks every other client out until it is
+    restarted. The reader keeps a weak reference instead and hangs up on the
+    next frame.
+    """
+    async def main() -> None:
+        async with FakeDongle(heartbeat_interval=0.1) as dongle:
+            client = AsyncDongleClient(dongle.host, SERIAL, port=dongle.port)
+            await client.connect()
+            assert dongle.connections == 1
+
+            ref = weakref.ref(client)
+            del client
+            gc.collect()
+            assert ref() is None, "the reader must not keep its client alive"
+
+            # the reader notices on the next heartbeat and closes the socket
+            await wait_until(lambda: dongle.disconnects >= 1, timeout=3.0)
 
     asyncio.run(main())
 
