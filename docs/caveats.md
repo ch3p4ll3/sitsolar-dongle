@@ -178,4 +178,4 @@ register map grows. Please include:
 * **Your serial number redacted first.**
 
 Open an issue at
-[github.com/ch3p4ll3/sitsolar-dongle-reader/issues](https://github.com/ch3p4ll3/sitsolar-dongle-reader/issues).
+[github.com/ch3p4ll3/sitsolar-dongle/issues](https://github.com/ch3p4ll3/sitsolar-dongle/issues).

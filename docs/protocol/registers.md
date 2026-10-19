@@ -106,7 +106,7 @@ Use `--section` to poll one of these in isolation, e.g.
 ## Full map
 
 The tables below are generated directly from
-[`registers.py`](https://github.com/ch3p4ll3/sitsolar-dongle-reader/blob/main/src/sitsolar_dongle/registers.py),
+[`registers.py`](https://github.com/ch3p4ll3/sitsolar-dongle/blob/main/src/sitsolar_dongle/registers.py),
 so they cannot drift from the implementation.
 
 

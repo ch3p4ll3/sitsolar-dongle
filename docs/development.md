@@ -296,7 +296,7 @@ push to `main` that touches `docs/`, `retype.yml`, or the workflow itself.
 >>>
 
 The workflow lives at
-[`.github/workflows/docs.yml`](https://github.com/ch3p4ll3/sitsolar-dongle-reader/blob/main/.github/workflows/docs.yml)
+[`.github/workflows/docs.yml`](https://github.com/ch3p4ll3/sitsolar-dongle/blob/main/.github/workflows/docs.yml)
 and runs on `ubuntu-latest` with:
 
 | Setting | Why |
@@ -310,7 +310,7 @@ After the first successful run, set the Pages source to **GitHub Actions**:
 *Settings → Pages → Build and deployment → Source → GitHub Actions*.
 
 The site is then published at
-`https://ch3p4ll3.github.io/sitsolar-dongle-reader/` on every subsequent push
+`https://ch3p4ll3.github.io/sitsolar-dongle/` on every subsequent push
 to `main`.
 !!!
 
@@ -332,7 +332,7 @@ built with [hatchling](https://hatch.pypa.io/) from `pyproject.toml`.
 !!!info "The version is single-sourced"
 `[project] dynamic = ["version"]` plus `[tool.hatch.version]` tells hatchling to
 read the version from `__version__` in
-[`src/sitsolar_dongle/__init__.py`](https://github.com/ch3p4ll3/sitsolar-dongle-reader/blob/main/src/sitsolar_dongle/__init__.py).
+[`src/sitsolar_dongle/__init__.py`](https://github.com/ch3p4ll3/sitsolar-dongle/blob/main/src/sitsolar_dongle/__init__.py).
 There is **one** place to bump it, and the CLI's `--version` output stays in
 step automatically.
 !!!
@@ -363,7 +363,7 @@ python -m venv /tmp/smoke && /tmp/smoke/bin/pip install dist/*.whl
 ## Continuous deployment to PyPI
 
 Publishing is handled by
-[`.github/workflows/publish-pypi.yml`](https://github.com/ch3p4ll3/sitsolar-dongle-reader/blob/main/.github/workflows/publish-pypi.yml)
+[`.github/workflows/publish-pypi.yml`](https://github.com/ch3p4ll3/sitsolar-dongle/blob/main/.github/workflows/publish-pypi.yml)
 and is triggered by a **published GitHub Release**. It runs three jobs:
 
 >>> 1. Test
@@ -382,7 +382,7 @@ and is triggered by a **published GitHub Release**. It runs three jobs:
 
 >>
 
-A separate [CI workflow](https://github.com/ch3p4ll3/sitsolar-dongle-reader/blob/main/.github/workflows/ci.yml)
+A separate [CI workflow](https://github.com/ch3p4ll3/sitsolar-dongle/blob/main/.github/workflows/ci.yml)
 runs the same tests plus a build check on every push to `main` and every pull
 request, so a release is the last gate rather than the first time anything runs.
 
@@ -398,7 +398,7 @@ On the project page: **Manage → Publishing → Add a new publisher**
 | Field | Value |
 |---|---|
 | Owner | `ch3p4ll3` |
-| Repository | `sitsolar-dongle-reader` |
+| Repository | `sitsolar-dongle` |
 | Workflow name | `publish-pypi.yml` |
 | Environment name | `pypi` |
 

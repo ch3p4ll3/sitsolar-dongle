@@ -26,7 +26,7 @@ keywords = [
 ]
 
 authors = [
-    { name = "sitsolar-dongle-reader contributors" },
+    { name = "ch3p4ll3" },
 ]
 
 classifiers = [
@@ -60,11 +60,11 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://github.com/ch3p4ll3/sitsolar-dongle-reader"
-Repository = "https://github.com/ch3p4ll3/sitsolar-dongle-reader"
-Documentation = "https://ch3p4ll3.github.io/sitsolar-dongle-reader/"
-Issues = "https://github.com/ch3p4ll3/sitsolar-dongle-reader/issues"
-Changelog = "https://github.com/ch3p4ll3/sitsolar-dongle-reader/releases"
+Homepage = "https://github.com/ch3p4ll3/sitsolar-dongle"
+Repository = "https://github.com/ch3p4ll3/sitsolar-dongle"
+Documentation = "https://ch3p4ll3.github.io/sitsolar-dongle/"
+Issues = "https://github.com/ch3p4ll3/sitsolar-dongle/issues"
+Changelog = "https://github.com/ch3p4ll3/sitsolar-dongle/releases"
 
 [project.scripts]
 sitsolar-dongle = "sitsolar_dongle.cli:main"

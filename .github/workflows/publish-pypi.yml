@@ -8,7 +8,7 @@ name: Publish to PyPI
 # One-time setup on pypi.org:
 #   Project -> Manage -> Publishing -> Add a new publisher
 #     Owner:      ch3p4ll3
-#     Repository: sitsolar-dongle-reader
+#     Repository: sitsolar-dongle
 #     Workflow:   publish-pypi.yml
 #     Environment: pypi      <- must match `environment.name` below
 #

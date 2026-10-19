@@ -44,7 +44,7 @@ from .framing import (MAX_REGISTERS, HEADER, DongleNoDataError, Frame,
                       ModbusError, build_read, parse_read_reply, wrap_payload)
 from .registers import REGISTERS, Register, blocks
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "AsyncDongleClient",
