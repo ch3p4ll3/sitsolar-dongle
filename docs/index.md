@@ -1,11 +1,11 @@
 ---
-title: sitsolar-dongle-reader
+title: sitsolar-dongle
 icon: book
 order: 0
 description: Read-only Modbus client for the SiNeng / FuturaPulse WiFi dongle used by Sit Solar inverters.
 ---
 
-# sitsolar-dongle-reader
+# sitsolar-dongle
 
 A read-only Modbus client for the **SiNeng / FuturaPulse** WiFi dongle that
 ships with Sit Solar inverters — the "Si-Dongle-L" that listens on TCP port
@@ -66,8 +66,8 @@ Python API.
 ## Quick start
 
 ```bash
-git clone https://github.com/ch3p4ll3/sitsolar-dongle-reader.git
-cd sitsolar-dongle-reader
+git clone https://github.com/ch3p4ll3/sitsolar-dongle.git
+cd sitsolar-dongle
 uv venv && uv sync
 
 sitsolar-dongle 192.168.1.50 --sn <DONGLE_SERIAL>

@@ -257,7 +257,7 @@ class AsyncDongleClient(ClientCore):
         self._reader_task = asyncio.create_task(
             _reader_loop(generation, reader, writer, weakref.ref(self),
                          self.keepalive),
-            name="sitsolar-dongle-reader")
+            name="sitsolar-dongle")
 
     async def _answer_push(self, frame: Frame,
                            writer: asyncio.StreamWriter) -> None:

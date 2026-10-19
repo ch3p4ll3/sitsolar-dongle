@@ -1,4 +1,4 @@
-# sitsolar-dongle-reader
+# sitsolar-dongle
 
 Read-only Modbus client for the **SiNeng / FuturaPulse** WiFi dongle that ships
 with Sit Solar inverters (the "Si-Dongle-L" on TCP port 7078).
@@ -17,12 +17,12 @@ Nothing in this package ever writes to the inverter — only FC 0x04 / 0x03 read
 ## Documentation
 
 Full documentation is published at
-**<https://ch3p4ll3.github.io/sitsolar-dongle-reader/>** — it covers the
-[install walkthrough](https://ch3p4ll3.github.io/sitsolar-dongle-reader/getting-started/),
-the [CLI](https://ch3p4ll3.github.io/sitsolar-dongle-reader/cli/) and
-[Python API](https://ch3p4ll3.github.io/sitsolar-dongle-reader/library/)
-references, the [wire protocol](https://ch3p4ll3.github.io/sitsolar-dongle-reader/protocol/),
-and the [complete register map](https://ch3p4ll3.github.io/sitsolar-dongle-reader/protocol/registers/)
+**<https://ch3p4ll3.github.io/sitsolar-dongle/>** — it covers the
+[install walkthrough](https://ch3p4ll3.github.io/sitsolar-dongle/getting-started/),
+the [CLI](https://ch3p4ll3.github.io/sitsolar-dongle/cli/) and
+[Python API](https://ch3p4ll3.github.io/sitsolar-dongle/library/)
+references, the [wire protocol](https://ch3p4ll3.github.io/sitsolar-dongle/protocol/),
+and the [complete register map](https://ch3p4ll3.github.io/sitsolar-dongle/protocol/registers/)
 with known hardware quirks.
 
 The site is built from [`docs/`](docs/) with [Retype](https://retype.com) and
@@ -51,7 +51,7 @@ uv venv && uv sync
 Requires Python 3.10+ and `pycryptodome`.
 
 New versions are published to PyPI automatically whenever a GitHub Release is
-published — see [Development](https://ch3p4ll3.github.io/sitsolar-dongle-reader/development/)
+published — see [Development](https://ch3p4ll3.github.io/sitsolar-dongle/development/)
 for the release process.
 
 ## Quick start

@@ -6,7 +6,7 @@ name: Build and deploy documentation
 #     Source: GitHub Actions
 #
 # The site is then published to
-#     https://ch3p4ll3.github.io/sitsolar-dongle-reader/
+#     https://ch3p4ll3.github.io/sitsolar-dongle/
 # on every push to main that touches the documentation.
 
 on:

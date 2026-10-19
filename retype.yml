@@ -10,7 +10,7 @@ output: .retype
 # Canonical address of the published site (GitHub Pages project site).
 # `cname: false` keeps Retype from writing a CNAME file, which would break a
 # *.github.io project site.
-url: https://ch3p4ll3.github.io/sitsolar-dongle-reader
+url: https://ch3p4ll3.github.io/sitsolar-dongle
 cname: false
 
 generator:
@@ -24,7 +24,7 @@ branding:
 meta:
   description: Read-only Modbus client for the SiNeng / FuturaPulse WiFi dongle
     that ships with Sit Solar inverters.
-  author: sitsolar-dongle-reader contributors
+  author: ch3p4ll3
   keywords:
     - modbus
     - siNeng
@@ -38,7 +38,7 @@ meta:
 
 # "Edit this page" links back to the docs/ sources on GitHub.
 edit:
-  repo: https://github.com/ch3p4ll3/sitsolar-dongle-reader
+  repo: https://github.com/ch3p4ll3/sitsolar-dongle
   base: /docs
   branch: main
 
@@ -50,17 +50,17 @@ lastUpdated:
 
 links:
   - text: GitHub
-    link: https://github.com/ch3p4ll3/sitsolar-dongle-reader
+    link: https://github.com/ch3p4ll3/sitsolar-dongle
     icon: mark-github
     target: blank
     title: Source repository
   - text: Report an issue
-    link: https://github.com/ch3p4ll3/sitsolar-dongle-reader/issues
+    link: https://github.com/ch3p4ll3/sitsolar-dongle/issues
     icon: issue-opened
     target: blank
 
 footer:
-  copyright: "&copy; {{ year }} sitsolar-dongle-reader contributors. Released under the GPL-3.0 license."
+  copyright: "&copy; {{ year }} sitsolar-dongle contributors. Released under the GPL-3.0 license."
   links:
     - text: License
       link: license.md
