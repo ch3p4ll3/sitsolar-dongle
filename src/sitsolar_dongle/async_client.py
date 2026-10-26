@@ -159,6 +159,9 @@ class AsyncDongleClient(ClientCore):
         self._generation += 1
         self._dead_reason = None
         self._timeouts = 0
+        # a fresh connection may reach a dongle with a different table, so
+        # every parked refusal earns a probe again
+        self._parked.clear()
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port), self.timeout)
@@ -393,20 +396,35 @@ class AsyncDongleClient(ClientCore):
         bare ``64 07 01`` stub
         (:class:`~sitsolar_dongle.framing.DongleNoDataError`).  Both are
         recorded under ``_unreadable_ranges``.
+
+        A range refused by the *dongle's table* (the stub) is read only once
+        per connection: the refusal is parked, so later polls re-report the
+        recorded entry but send no further request for it -- the battery2
+        block on a single-battery dongle otherwise costs five doomed round
+        trips every cycle.  :meth:`connect` clears the park, and an
+        inverter-side :class:`~sitsolar_dongle.framing.ModbusError` is
+        retried every poll because it can be transient.
         """
         target = self.slave if slave is None else slave
         words: dict[int, int] = {}
         failures: list[dict[str, Any]] = []
 
         for start, end in blocks():
+            parked = self._parked_record(start, end)
+            if parked is not None:
+                failures.append(parked)
+                continue
             count = end - start + 1
             try:
                 values = await self.read(start, count, slave=target, fc=fc)
-            except (ModbusError, DongleNoDataError) as exc:
+            except DongleNoDataError as exc:
+                self._note_failure(failures, start, end, exc, on_error,
+                                   park=True)
+            except ModbusError as exc:
                 self._note_failure(failures, start, end, exc, on_error)
-                continue
-            for offset, value in enumerate(values):
-                words[start + offset] = value
+            else:
+                for offset, value in enumerate(values):
+                    words[start + offset] = value
 
         return self._assemble(words, failures)
 

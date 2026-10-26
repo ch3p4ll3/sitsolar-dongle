@@ -69,6 +69,15 @@ self-test) may refuse a read. A refusal comes in **two** flavours:
 Both are recorded under `_unreadable_ranges` by default. See
 [Protocol](protocol/index.md#the-64-07-01-stub) for the wire-level detail.
 
+A `DongleNoDataError` is additionally **parked**: that stub reflects the
+dongle's own forwarding table, so the range is probed once per connection and
+then skipped on the wire — still listed under `_unreadable_ranges` with its
+original error, but never re-requested until `connect()` runs again.
+`ModbusError` is retried on every poll, because an inverter exception can be
+transient. On a single-BMS dongle this parks the whole `32240–32293` battery2
+block: five doomed round trips every cycle become a single probe per
+connection.
+
 ### Handling them
 
 ```bash

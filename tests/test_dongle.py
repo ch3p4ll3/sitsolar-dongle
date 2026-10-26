@@ -200,6 +200,46 @@ def test_register_map_is_consistent() -> None:
         assert e1 < a2, "%s (%d-%d) overlaps %d" % (k1, a1, e1, a2)
 
 
+def test_poll_parks_dongle_table_refusals() -> None:
+    """``poll()`` reads a dongle-table refusal once, then parks it.
+
+    The dongle's bare ``64 07 01`` means "outside my forwarding table", so
+    another attempt could only pay for another doomed round trip: the range
+    stays reported under ``_unreadable_ranges`` with the original message,
+    but disappears from the wire.  A reconnect would probe it again (the
+    async client covers that end to end against a fake dongle).
+    """
+    from sitsolar_dongle.client import DongleClient
+
+    client = DongleClient("127.0.0.1", "TESTDONGLE0000001")
+    parked_block = next(b for b in blocks() if b[0] == 32240)
+    tried: list[tuple[int, int]] = []
+
+    def fake_read(address: int, count: int, *, slave=None, fc=4):
+        tried.append((address, address + count - 1))
+        if (address, address + count - 1) == parked_block:
+            raise DongleNoDataError(0x01)
+        return (0,) * count
+
+    client.read = fake_read  # type: ignore[method-assign]
+
+    first = client.poll()
+    failures = first["_unreadable_ranges"]
+    assert [f["range"] for f in failures] == ["32240~32240"]
+    assert "stub" in failures[0]["error"]
+    assert first["battery2_status"]["error"] == "unavailable"
+    assert parked_block in tried
+
+    tried.clear()
+    second = client.poll()
+    # reported exactly as before, down to the original error message...
+    assert second["_unreadable_ranges"] == failures
+    assert second["battery2_status"] == first["battery2_status"]
+    # ...while the refused range is no longer on the wire
+    assert parked_block not in tried
+    assert len(tried) == len(blocks()) - 1
+
+
 def test_blocks_cover_the_map_and_fit_in_one_frame() -> None:
     wanted = set()
     for reg in REGISTERS:

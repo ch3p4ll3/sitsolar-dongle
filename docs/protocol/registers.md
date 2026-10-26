@@ -527,8 +527,8 @@ The 25 known labels are carried in the register's `enum` map and surface as the
 | `32057~32058` `battery_power` | Positive means **discharge**. |
 | `33016~33017` `meter_total_p` | Positive = generation, negative = consumption. |
 | `30412~30416` `bms_software_version` | Depends on which battery is attached; may be absent. |
-| `32240~32293` `battery2_parameters` | Second-battery block, added in v0.0.7 — only valid on inverters with two BMS interfaces; on single-battery units the dongle may refuse the range (it lands in `_unreadable_ranges`) or return zeros. |
-| `33101~33143` `meter2_parameters` | Second-meter block, added in v0.0.7 — only valid when a second meter is installed; expect the same refusal-or-zeros behaviour as battery2 on units without one. |
+| `32240~32293` `battery2_parameters` | Second-battery block, added in v0.0.7 — only valid on inverters with two BMS interfaces. A dongle without the range in its table answers the bare `64 07 01` stub, which is **parked after the first probe**: the block stays listed in `_unreadable_ranges` (and its keys read `unavailable`) but is not re-read until `connect()` runs again. |
+| `33101~33143` `meter2_parameters` | Second-meter block, added in v0.0.7 — only valid when a second meter is installed; expect the same refusal-or-zeros behaviour as battery2 on units without one, stubs parked the same way. |
 
 ---
 

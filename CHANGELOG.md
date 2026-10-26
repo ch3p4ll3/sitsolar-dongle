@@ -22,6 +22,14 @@ protocol v0.0.7* (the previous transcription was v0.0.3).
 - **Meter self-test registers `33048` (`meter_testing_process`, 0~100 %) and
   `33049` (`meter_testing_result`, 14 enum labels including the `0xAA55`
   "testing" sentinel)** in `meter_parameters` (change D007).
+- **`poll()` parks dongle-table refusals.** A range answered with the dongle's
+  bare `64 07 01` stub (the battery2 block on a single-BMS dongle, for
+  instance) is probed once per connection and then skipped on the wire, while
+  still being reported under `_unreadable_ranges` with the original error and
+  its registers still reading `unavailable` — so the output shape is stable
+  and five doomed round trips per cycle drop to one probe per connection.
+  `connect()` clears the park; inverter-side `ModbusError` is never parked,
+  because it can be transient.
 
 The map now holds **235 values** across **42 coalesced read ranges** (was 183
 across 34), in fourteen sections.

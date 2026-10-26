@@ -163,6 +163,11 @@ class ClientCore:
         self.keys: Keys = derive_keys(serial)
         self.info: DongleInfo | None = None
         self._tid = 0
+        #: Read ranges the *dongle's* forwarding table refused (bare
+        #: ``64 07 01`` stub), mapped to the failure record to keep
+        #: reporting.  Probed once per connection and then skipped on the
+        #: wire -- see :meth:`_note_failure`.
+        self._parked: dict[tuple[int, int], dict[str, Any]] = {}
 
     def __repr__(self) -> str:
         return "%s(host=%r, port=%r)" % (type(self).__name__, self.host,
@@ -197,11 +202,29 @@ class ClientCore:
 
     # -- decode --------------------------------------------------------
     def _note_failure(self, failures: list[dict[str, Any]], start: int,
-                      end: int, exc: Exception, on_error: str) -> None:
-        """Record a refused range, or re-raise it under ``on_error="raise"``."""
+                      end: int, exc: Exception, on_error: str,
+                      *, park: bool = False) -> None:
+        """Record a refused range, or re-raise it under ``on_error="raise"``.
+
+        With *park* the refusal is remembered on the client, so later polls
+        report the very same record without reading the range again.  Only
+        the dongle's bare ``64 07 01`` stub earns that: it means "outside my
+        forwarding table", which a reconnect can change but a retry cannot.
+        Inverter-side :class:`ModbusError` is never parked -- an exception
+        like 0x06 slave-busy is transient, and parking it would drop the
+        range for the rest of the session.
+        """
         if on_error == "raise":
             raise exc
-        failures.append({"range": "%d~%d" % (start, end), "error": str(exc)})
+        record = {"range": "%d~%d" % (start, end), "error": str(exc)}
+        if park:
+            self._parked[(start, end)] = record
+        failures.append(record)
+
+    def _parked_record(self, start: int, end: int) -> dict[str, Any] | None:
+        """A copy of the stored refusal for *(start, end)*, if it is parked."""
+        record = self._parked.get((start, end))
+        return dict(record) if record is not None else None
 
     def _assemble(self, words: dict[int, int],
                   failures: list[dict[str, Any]]) -> dict[str, Any]:

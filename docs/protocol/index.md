@@ -111,6 +111,13 @@ This is a *dongle-level* refusal, distinct from a Modbus exception raised by the
 |---|---|
 | Past `34100` | A proper Modbus exception `0x02` (illegal data address) from the inverter. |
 | `33051–33100`, `33950–33999`, `34051–34100` | The bare `64 07 01` stub from the dongle. |
+| `32240–32293` (battery2) | The bare stub on a dongle whose table has no second battery. |
+
+Because the stub reflects the dongle's *forwarding table*, re-asking cannot
+help, so `poll()` parks such a range after its first appearance: it keeps
+being reported under `_unreadable_ranges` with the original error, but is not
+put on the wire again until `connect()` runs and a possibly different table
+is probed fresh.
 
 See [Troubleshooting](../caveats.md#two-kinds-of-refusal).
 
