@@ -1,6 +1,6 @@
 """Read-only register map of the FuturaPulse hybrid inverter.
 
-Transcribed from *FuturaPulse hybrid inverter modbus protocol v0.0.3*.
+Transcribed from *FuturaPulse hybrid inverter modbus protocol v0.0.7*.
 Only the read-only input registers (30000~39999, function code 0x04) are
 listed here; the writable holding registers (40001~49999, FC 0x03/0x06/0x10)
 are deliberately omitted because this project never writes.
@@ -78,8 +78,10 @@ SECTION_RANGES = (
     (30500, 30999, "DC_side"),
     (31000, 31999, "AC_side"),
     (32000, 32039, "EPS_parameters"),
-    (32040, 32999, "battery_parameters"),
-    (33000, 33999, "meter_parameters"),
+    (32040, 32239, "battery_parameters"),
+    (32240, 32299, "battery2_parameters"),
+    (33000, 33099, "meter_parameters"),
+    (33100, 33199, "meter2_parameters"),
     (34000, 34999, "generation_info"),
     (35000, 35999, "Italy_self-test"),
 )
@@ -104,9 +106,11 @@ OPERATION_STATUS = {
     4: "error", 5: "debug", 7: "off-grid",
 }
 
+# v0.0.7 (change D006, 2025-03-11 "Modify 30103 describe") reduced this from
+# the five values of v0.0.3 (0: no input, 1: single string connected, 2: two
+# strings parallel, 3: different panels parallel, 4: same panels parallel).
 MPPT_INPUT_TYPE = {
-    0: "no input", 1: "single string connected", 2: "two strings parallel",
-    3: "different panels parallel", 4: "same panels parallel",
+    0: "independent input", 1: "same panels parallel",
 }
 
 BATTERY_STATUS = {
@@ -114,6 +118,26 @@ BATTERY_STATUS = {
 }
 
 BMS_STATUS = {0: "fail", 1: "ok", 2: "battery not chosen"}
+
+# v0.0.7 section 5.3.0 (added by change D007, 2025-06-11): 33049 reports the
+# outcome of the meter self test.  0xAA55 means "still testing" and is the only
+# non-sequential value in the list.
+METER_TEST_RESULT = {
+    0xAA55: "testing",
+    1: "meter communications fail",
+    2: "battery communications fail",
+    3: "meter L-N reversed (single phase meter)",
+    4: "meter check successful",
+    5: "meter disabled",
+    6: "load fluctuation too large to judge",
+    7: "inverter not working normally",
+    8: "other fail",
+    9: "CT not connected or meter cover open",
+    16: "current lower than required",
+    17: "incorrect meter wiring (three-phase four-wire)",
+    18: "meter and inverter interaction failed",
+    19: "meter self-test failed",
+}
 
 # Appendix 1, Charts 8-10: registers 30207-30210 are four bit-field warning
 # words.  Chart 11 (register 30211) is NOT a bit field -- it carries a single
@@ -223,7 +247,10 @@ REGISTERS: tuple[Register, ...] = (
     # ---- operation_data -----------------------------------------
     _r(30100, "operation_status", "Operation status", enum=OPERATION_STATUS),
     _r(30101, "auto_start_remaining", "Auto start time remaining", unit="s"),
-    _r(30103, "mppt_input_type", "MPPT input type", enum=MPPT_INPUT_TYPE),
+    _r(30103, "mppt_input_type", "MPPT input type", enum=MPPT_INPUT_TYPE,
+       notes="v0.0.3 listed five values (no input / single string connected / "
+             "two strings parallel / different panels parallel / same panels "
+             "parallel); v0.0.7 reduced them to two"),
     _r(30104, "mppt_string_number", "MPPT string number"),
     _r(30105, "pv_string_number", "PV string number"),
     _r(30106, "dc_power_flags", "DC power lose or updating signs", dtype=BITFIELD,
@@ -383,6 +410,66 @@ REGISTERS: tuple[Register, ...] = (
        dtype=S16, unit="°C", scale=0.1),
     _r(32093, "lowest_temperature_cell", "Lowest temperature cell No."),
 
+    # ---- battery2_parameters ------------------------------------
+    # v0.0.7 section 5.2.9 (added by change D005, 2025-03-04).  A verbatim
+    # mirror of the battery1 block at +200, valid only on inverters with two
+    # BMS interfaces; on single-battery units the block reads as zeros or
+    # fails outright, exactly like any other undocumented address.
+    _r(32240, "battery2_status", "Battery 2 status", enum=BATTERY_STATUS,
+       notes="second battery; valid only if the inverter has two BMS "
+             "interfaces"),
+    _r(32251, "battery2_bms_status", "BMS 2 communication status", enum=BMS_STATUS),
+    _r(32255, "battery2_voltage", "Battery 2 voltage", unit="V", scale=0.1),
+    _r(32256, "battery2_current", "Battery 2 current", dtype=S16,
+       unit="A", scale=0.01, notes="positive = discharge"),
+    _r(32257, "battery2_power", "Battery 2 power", dtype=S32, unit="W",
+       notes="positive = discharge"),
+    _r(32263, "battery2_temperature", "Battery 2 temperature", dtype=S16,
+       unit="°C", scale=0.1),
+    _r(32264, "battery2_soc", "Battery 2 SOC", unit="%"),
+    _r(32265, "battery2_soh", "Battery 2 SOH", unit="%",
+       notes="the document prints this address as 322065, an obvious typo "
+             "for 32265"),
+    _r(32269, "battery2_forbid_charge", "Battery 2 forbid charge flag",
+       enum={0: "chargeable", 1: "charge forbidden"}),
+    _r(32270, "battery2_forbid_discharge", "Battery 2 forbid discharge flag",
+       enum={0: "dischargeable", 1: "discharge forbidden"}),
+    _r(32271, "battery2_forced_mode_request",
+       "Battery 2 request forced charge or discharge",
+       enum={0: "neither", 1: "normal charge", 2: "forced charge"}),
+    _r(32272, "battery2_error1", "Battery 2 error 1"),
+    _r(32273, "battery2_error2", "Battery 2 error 2"),
+    _r(32274, "battery2_error3", "Battery 2 error 3"),
+    _r(32275, "battery2_warning1", "Battery 2 warning 1"),
+    _r(32276, "battery2_warning2", "Battery 2 warning 2"),
+    _r(32277, "battery2_warning3", "Battery 2 warning 3"),
+    _r(32278, "battery2_protection1", "Battery 2 protection 1"),
+    _r(32279, "battery2_protection2", "Battery 2 protection 2"),
+    _r(32280, "battery2_protection3", "Battery 2 protection 3"),
+    _r(32281, "battery2_cycles", "Battery 2 cycles"),
+    _r(32282, "battery2_max_charge_voltage", "Battery 2 max charge voltage",
+       unit="V", scale=0.1),
+    _r(32283, "battery2_max_charge_current", "Battery 2 max charge current",
+       unit="A", scale=0.01),
+    _r(32284, "battery2_min_discharge_voltage", "Battery 2 min discharge voltage",
+       unit="V", scale=0.1),
+    _r(32285, "battery2_max_discharge_current", "Battery 2 max discharge current",
+       dtype=S16, unit="A", scale=0.01),
+    _r(32286, "battery2_highest_cell_voltage", "Battery 2 highest cell voltage",
+       unit="V", scale=0.001),
+    _r(32287, "battery2_highest_voltage_cell", "Battery 2 highest voltage cell No."),
+    _r(32288, "battery2_lowest_cell_voltage", "Battery 2 lowest cell voltage",
+       unit="V", scale=0.001),
+    _r(32289, "battery2_lowest_voltage_cell", "Battery 2 lowest voltage cell No."),
+    _r(32290, "battery2_highest_cell_temperature",
+       "Battery 2 highest cell temperature", dtype=S16, unit="°C", scale=0.1),
+    _r(32291, "battery2_highest_temperature_cell",
+       "Battery 2 highest temperature cell No."),
+    _r(32292, "battery2_lowest_cell_temperature",
+       "Battery 2 lowest cell temperature", dtype=S16, unit="°C", scale=0.1),
+    _r(32293, "battery2_lowest_temperature_cell",
+       "Battery 2 lowest temperature cell No."),
+
     # ---- meter_parameters ---------------------------------------
     _r(33001, "meter_r_voltage", "Meter R-phase voltage", unit="V", scale=0.1),
     _r(33002, "meter_r_current", "Meter R-phase current", dtype=S16,
@@ -415,6 +502,42 @@ REGISTERS: tuple[Register, ...] = (
        dtype=U32, notes="sell to grid"),
     _r(33042, "energy_from_grid_total", "E-Total from grid", unit="kWh", scale=0.1,
        dtype=U32, notes="buy from grid"),
+    # v0.0.7 additions (change D007, 2025-06-11): the meter self-test status.
+    _r(33048, "meter_testing_process", "Meter testing process", unit="%",
+       notes="0~100, progress of the meter self test"),
+    _r(33049, "meter_testing_result", "Result of meter testing",
+       enum=METER_TEST_RESULT),
+
+    # ---- meter2_parameters --------------------------------------
+    # v0.0.7 section 5.3.1 (added by change D009, 2026-10-24): a verbatim
+    # mirror of the meter1 block at +100, for the optional second meter.
+    _r(33101, "meter2_r_voltage", "Meter 2 R-phase voltage", unit="V", scale=0.1),
+    _r(33102, "meter2_r_current", "Meter 2 R-phase current", dtype=S16,
+       unit="A", scale=0.1,
+       notes="same doubtful 0.1 scale as meter1's 33002"),
+    _r(33103, "meter2_r_frequency", "Meter 2 R-phase frequency",
+       unit="Hz", scale=0.01),
+    _r(33104, "meter2_r_power", "Meter 2 R-phase power", dtype=S32, unit="W"),
+    _r(33106, "meter2_s_voltage", "Meter 2 S-phase voltage", unit="V", scale=0.1),
+    _r(33107, "meter2_s_current", "Meter 2 S-phase current", dtype=S16,
+       unit="A", scale=0.1),
+    _r(33108, "meter2_s_frequency", "Meter 2 S-phase frequency",
+       unit="Hz", scale=0.01),
+    _r(33109, "meter2_s_power", "Meter 2 S-phase power", dtype=S32, unit="W"),
+    _r(33111, "meter2_t_voltage", "Meter 2 T-phase voltage", unit="V", scale=0.1),
+    _r(33112, "meter2_t_current", "Meter 2 T-phase current", dtype=S16,
+       unit="A", scale=0.1),
+    _r(33113, "meter2_t_frequency", "Meter 2 T-phase frequency",
+       unit="Hz", scale=0.01),
+    _r(33114, "meter2_t_power", "Meter 2 T-phase power", dtype=S32, unit="W"),
+    _r(33116, "meter2_total_p", "Meter 2 total P", dtype=S32, unit="W",
+       notes="positive = generation, negative = consumption"),
+    _r(33118, "meter2_total_q", "Meter 2 total Q", dtype=S32, unit="var"),
+    _r(33120, "meter2_power_factor", "Meter 2 power factor", dtype=S16, scale=0.01),
+    _r(33140, "meter2_energy_to_grid_total", "Meter 2 E-Total to grid",
+       unit="kWh", scale=0.1, dtype=U32, notes="sell to grid"),
+    _r(33142, "meter2_energy_from_grid_total", "Meter 2 E-Total from grid",
+       unit="kWh", scale=0.1, dtype=U32, notes="buy from grid"),
 
     # ---- generation_info ------------------------------------------
     # Every *_total below is U32 and was first written without dtype=U32, which

@@ -171,7 +171,7 @@ push's own transaction id, exactly like the app does.
 ## Register map
 
 Read-only **input registers** `30000`–`35017`, transcribed from
-*FuturaPulse hybrid inverter Modbus protocol v0.0.3*:
+*FuturaPulse hybrid inverter Modbus protocol v0.0.7*:
 
 | Section | Range |
 |---|---|
@@ -184,7 +184,9 @@ Read-only **input registers** `30000`–`35017`, transcribed from
 | AC_side | 31000–31040 |
 | EPS_parameters | 32001–32026 |
 | battery_parameters | 32040–32093 |
-| meter_parameters | 33001–33043 |
+| battery2_parameters | 32240–32293 |
+| meter_parameters | 33001–33049 |
+| meter2_parameters | 33101–33143 |
 | generation_info | 34001–34043 |
 | Italy_self-test | 35001–35017 |
 

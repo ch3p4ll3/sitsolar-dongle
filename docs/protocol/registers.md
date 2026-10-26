@@ -7,9 +7,9 @@ order: -6
 # Register Map
 
 Read-only **input registers** `30000`–`35017`, transcribed from the
-*FuturaPulse hybrid inverter Modbus protocol v0.0.3*.
+*FuturaPulse hybrid inverter Modbus protocol v0.0.7*.
 
-**183 values** across **34 coalesced read ranges**, in twelve sections matching
+**235 values** across **42 coalesced read ranges**, in fourteen sections matching
 the chapters of the source document.
 
 !!!success This project never writes
@@ -94,7 +94,9 @@ Enums and bit fields are decoded into human-readable names: enumerations become
 | `AC_side` | `31000–31040` | 18 |
 | `EPS_parameters` | `32001–32026` | 15 |
 | `battery_parameters` | `32040–32093` | 33 |
-| `meter_parameters` | `33001–33043` | 17 |
+| `battery2_parameters` | `32240–32293` | 33 |
+| `meter_parameters` | `33001–33049` | 19 |
+| `meter2_parameters` | `33101–33143` | 17 |
 | `generation_info` | `34001–34043` | 27 |
 | `Italy_self-test` | `35001–35017` | 17 |
 
@@ -108,7 +110,6 @@ Use `--section` to poll one of these in isolation, e.g.
 The tables below are generated directly from
 [`registers.py`](https://github.com/ch3p4ll3/sitsolar-dongle/blob/main/src/sitsolar_dongle/registers.py),
 so they cannot drift from the implementation.
-
 
 
 ### device_info
@@ -141,7 +142,7 @@ so they cannot drift from the implementation.
 |---|---|---|---|---|---|---|
 | `30100` | `operation_status` | Operation status | U16 |  |  | 7 enum labels |
 | `30101` | `auto_start_remaining` | Auto start time remaining | U16 |  | s |  |
-| `30103` | `mppt_input_type` | MPPT input type | U16 |  |  | 5 enum labels |
+| `30103` | `mppt_input_type` | MPPT input type | U16 |  |  | v0.0.3 listed five values (no input / single string connected / two strings parallel / different panels parallel / same panels parallel); v0.0.7 reduced them to two. 2 enum labels |
 | `30104` | `mppt_string_number` | MPPT string number | U16 |  |  |  |
 | `30105` | `pv_string_number` | PV string number | U16 |  |  |  |
 | `30106` | `dc_power_flags` | DC power lose or updating signs | BITFIELD |  |  | 2 named bits |
@@ -266,7 +267,7 @@ so they cannot drift from the implementation.
 
 ### battery_parameters
 
-`32040–32999` — 33 value(s)
+`32040–32239` — 33 value(s)
 
 | Address | Key | Name | Type | Scale | Unit | Notes |
 |---|---|---|---|---|---|---|
@@ -305,9 +306,50 @@ so they cannot drift from the implementation.
 | `32093` | `lowest_temperature_cell` | Lowest temperature cell No. | U16 |  |  |  |
 
 
+### battery2_parameters
+
+`32240–32299` — 33 value(s)
+
+| Address | Key | Name | Type | Scale | Unit | Notes |
+|---|---|---|---|---|---|---|
+| `32240` | `battery2_status` | Battery 2 status | U16 |  |  | second battery; valid only if the inverter has two BMS interfaces. 4 enum labels |
+| `32251` | `battery2_bms_status` | BMS 2 communication status | U16 |  |  | 3 enum labels |
+| `32255` | `battery2_voltage` | Battery 2 voltage | U16 | `0.1` | V |  |
+| `32256` | `battery2_current` | Battery 2 current | S16 | `0.01` | A | positive = discharge |
+| `32257~32258` | `battery2_power` | Battery 2 power | S32 |  | W | positive = discharge |
+| `32263` | `battery2_temperature` | Battery 2 temperature | S16 | `0.1` | °C |  |
+| `32264` | `battery2_soc` | Battery 2 SOC | U16 |  | % |  |
+| `32265` | `battery2_soh` | Battery 2 SOH | U16 |  | % | the document prints this address as 322065, an obvious typo for 32265 |
+| `32269` | `battery2_forbid_charge` | Battery 2 forbid charge flag | U16 |  |  | 2 enum labels |
+| `32270` | `battery2_forbid_discharge` | Battery 2 forbid discharge flag | U16 |  |  | 2 enum labels |
+| `32271` | `battery2_forced_mode_request` | Battery 2 request forced charge or discharge | U16 |  |  | 3 enum labels |
+| `32272` | `battery2_error1` | Battery 2 error 1 | U16 |  |  |  |
+| `32273` | `battery2_error2` | Battery 2 error 2 | U16 |  |  |  |
+| `32274` | `battery2_error3` | Battery 2 error 3 | U16 |  |  |  |
+| `32275` | `battery2_warning1` | Battery 2 warning 1 | U16 |  |  |  |
+| `32276` | `battery2_warning2` | Battery 2 warning 2 | U16 |  |  |  |
+| `32277` | `battery2_warning3` | Battery 2 warning 3 | U16 |  |  |  |
+| `32278` | `battery2_protection1` | Battery 2 protection 1 | U16 |  |  |  |
+| `32279` | `battery2_protection2` | Battery 2 protection 2 | U16 |  |  |  |
+| `32280` | `battery2_protection3` | Battery 2 protection 3 | U16 |  |  |  |
+| `32281` | `battery2_cycles` | Battery 2 cycles | U16 |  |  |  |
+| `32282` | `battery2_max_charge_voltage` | Battery 2 max charge voltage | U16 | `0.1` | V |  |
+| `32283` | `battery2_max_charge_current` | Battery 2 max charge current | U16 | `0.01` | A |  |
+| `32284` | `battery2_min_discharge_voltage` | Battery 2 min discharge voltage | U16 | `0.1` | V |  |
+| `32285` | `battery2_max_discharge_current` | Battery 2 max discharge current | S16 | `0.01` | A |  |
+| `32286` | `battery2_highest_cell_voltage` | Battery 2 highest cell voltage | U16 | `0.001` | V |  |
+| `32287` | `battery2_highest_voltage_cell` | Battery 2 highest voltage cell No. | U16 |  |  |  |
+| `32288` | `battery2_lowest_cell_voltage` | Battery 2 lowest cell voltage | U16 | `0.001` | V |  |
+| `32289` | `battery2_lowest_voltage_cell` | Battery 2 lowest voltage cell No. | U16 |  |  |  |
+| `32290` | `battery2_highest_cell_temperature` | Battery 2 highest cell temperature | S16 | `0.1` | °C |  |
+| `32291` | `battery2_highest_temperature_cell` | Battery 2 highest temperature cell No. | U16 |  |  |  |
+| `32292` | `battery2_lowest_cell_temperature` | Battery 2 lowest cell temperature | S16 | `0.1` | °C |  |
+| `32293` | `battery2_lowest_temperature_cell` | Battery 2 lowest temperature cell No. | U16 |  |  |  |
+
+
 ### meter_parameters
 
-`33000–33999` — 17 value(s)
+`33000–33099` — 19 value(s)
 
 | Address | Key | Name | Type | Scale | Unit | Notes |
 |---|---|---|---|---|---|---|
@@ -328,6 +370,33 @@ so they cannot drift from the implementation.
 | `33020` | `meter_power_factor` | Meter power factor | S16 | `0.01` |  | self-consistent, unlike the inverter's 31022: with P at 0-1 W and Q at 25 var, P/sqrt(P^2+Q^2) is ~0.00-0.04 and the register reads 0.00. Any small value here just means grid exchange is near zero, so this number carries no information in self-consumption mode |
 | `33040~33041` | `energy_to_grid_total` | E-Total to grid | U32 | `0.1` | kWh | sell to grid |
 | `33042~33043` | `energy_from_grid_total` | E-Total from grid | U32 | `0.1` | kWh | buy from grid |
+| `33048` | `meter_testing_process` | Meter testing process | U16 |  | % | 0~100, progress of the meter self test |
+| `33049` | `meter_testing_result` | Result of meter testing | U16 |  |  | 14 enum labels |
+
+
+### meter2_parameters
+
+`33100–33199` — 17 value(s)
+
+| Address | Key | Name | Type | Scale | Unit | Notes |
+|---|---|---|---|---|---|---|
+| `33101` | `meter2_r_voltage` | Meter 2 R-phase voltage | U16 | `0.1` | V |  |
+| `33102` | `meter2_r_current` | Meter 2 R-phase current | S16 | `0.1` | A | same doubtful 0.1 scale as meter1's 33002 |
+| `33103` | `meter2_r_frequency` | Meter 2 R-phase frequency | U16 | `0.01` | Hz |  |
+| `33104~33105` | `meter2_r_power` | Meter 2 R-phase power | S32 |  | W |  |
+| `33106` | `meter2_s_voltage` | Meter 2 S-phase voltage | U16 | `0.1` | V |  |
+| `33107` | `meter2_s_current` | Meter 2 S-phase current | S16 | `0.1` | A |  |
+| `33108` | `meter2_s_frequency` | Meter 2 S-phase frequency | U16 | `0.01` | Hz |  |
+| `33109~33110` | `meter2_s_power` | Meter 2 S-phase power | S32 |  | W |  |
+| `33111` | `meter2_t_voltage` | Meter 2 T-phase voltage | U16 | `0.1` | V |  |
+| `33112` | `meter2_t_current` | Meter 2 T-phase current | S16 | `0.1` | A |  |
+| `33113` | `meter2_t_frequency` | Meter 2 T-phase frequency | U16 | `0.01` | Hz |  |
+| `33114~33115` | `meter2_t_power` | Meter 2 T-phase power | S32 |  | W |  |
+| `33116~33117` | `meter2_total_p` | Meter 2 total P | S32 |  | W | positive = generation, negative = consumption |
+| `33118~33119` | `meter2_total_q` | Meter 2 total Q | S32 |  | var |  |
+| `33120` | `meter2_power_factor` | Meter 2 power factor | S16 | `0.01` |  |  |
+| `33140~33141` | `meter2_energy_to_grid_total` | Meter 2 E-Total to grid | U32 | `0.1` | kWh | sell to grid |
+| `33142~33143` | `meter2_energy_from_grid_total` | Meter 2 E-Total from grid | U32 | `0.1` | kWh | buy from grid |
 
 
 ### generation_info
@@ -390,12 +459,12 @@ so they cannot drift from the implementation.
 | `35017` | `uf_test_time_s2` | 81<.S2 max time in underfrequency test | U16 | `0.1` | s |  |
 
 
-**Totals**: 183 values across 34 read ranges.
+**Totals**: 235 values across 42 read ranges.
 
 Coalesced read ranges:
 
 ```text
-30000–30034, 30041–30050, 30061–30062, 30070–30082, 30100–30101, 30103–30106, 30108–30109, 30200–30211, 30301–30301, 30303–30303, 30305–30305, 30307–30307, 30316–30316, 30400–30417, 30419–30421, 30500–30508, 31000–31007, 31010–31013, 31016–31022, 31035–31040, 32001–32002, 32005–32008, 32011–32014, 32017–32026, 32040–32040, 32051–32051, 32055–32058, 32063–32065, 32069–32093, 33001–33020, 33040–33043, 34001–34016, 34019–34043, 35001–35017
+30000–30034, 30041–30050, 30061–30062, 30070–30082, 30100–30101, 30103–30106, 30108–30109, 30200–30211, 30301–30301, 30303–30303, 30305–30305, 30307–30307, 30316–30316, 30400–30417, 30419–30421, 30500–30508, 31000–31007, 31010–31013, 31016–31022, 31035–31040, 32001–32002, 32005–32008, 32011–32014, 32017–32026, 32040–32040, 32051–32051, 32055–32058, 32063–32065, 32069–32093, 32240–32240, 32251–32251, 32255–32258, 32263–32265, 32269–32293, 33001–33020, 33040–33043, 33048–33049, 33101–33120, 33140–33143, 34001–34016, 34019–34043, 35001–35017
 ```
 
 ---
@@ -458,6 +527,8 @@ The 25 known labels are carried in the register's `enum` map and surface as the
 | `32057~32058` `battery_power` | Positive means **discharge**. |
 | `33016~33017` `meter_total_p` | Positive = generation, negative = consumption. |
 | `30412~30416` `bms_software_version` | Depends on which battery is attached; may be absent. |
+| `32240~32293` `battery2_parameters` | Second-battery block, added in v0.0.7 — only valid on inverters with two BMS interfaces; on single-battery units the dongle may refuse the range (it lands in `_unreadable_ranges`) or return zeros. |
+| `33101~33143` `meter2_parameters` | Second-meter block, added in v0.0.7 — only valid when a second meter is installed; expect the same refusal-or-zeros behaviour as battery2 on units without one. |
 
 ---
 

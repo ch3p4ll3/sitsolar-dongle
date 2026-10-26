@@ -326,7 +326,7 @@ def test_poll_decodes_the_whole_map() -> None:
                 assert values["grid_frequency"]["value"] == 50.02
                 assert values["grid_frequency"]["unit"] == "Hz"
                 assert "_unreadable_ranges" not in values
-                assert len(values) == 183
+                assert len(values) == 235
 
     asyncio.run(main())
 
