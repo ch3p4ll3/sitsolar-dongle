@@ -75,12 +75,15 @@ class DongleNoDataError(DongleError):
     The success prefix is ``64 07 00`` followed by the Modbus reply; when the
     dongle has nothing to return for a range it sends just those three bytes
     with a non-zero status and no Modbus frame behind it at all. Observed for
-    33051-33100, 33950-33999 and 34051-34100.
+    33051-33100, 33950-33999, 34051-34100 and 32240-32293 (the v0.0.7
+    battery2 block, on a dongle whose table has no second battery).
 
     This is a *dongle*-level refusal and is distinct from
     :class:`ModbusError`, which is the *inverter* rejecting the request -- e.g.
     34101+ answers a proper Modbus exception 0x02 (illegal data address) rather
-    than a stub.
+    than a stub.  Because it reflects the dongle's forwarding table,
+    ``poll()`` parks the range after the first refusal instead of retrying it
+    every cycle.
     """
 
     def __init__(self, status: int) -> None:

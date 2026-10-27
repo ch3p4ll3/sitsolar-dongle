@@ -45,7 +45,7 @@ Every frame is AES-128-CBC encrypted and HMAC-SHA256 signed. The MAC is checked
 before decryption, so a wrong key fails cleanly instead of producing garbage.
 |||
 
-||| :icon-database: 183 documented values
+||| :icon-database: 235 documented values
 
 A complete register map transcribed from the FuturaPulse hybrid inverter Modbus
 protocol, with enum labels, bit fields, and per-register scale factors.
@@ -91,7 +91,7 @@ it, paste it into issues, or share logs and packet captures that contain it.
 | [CLI Reference](cli.md) | Every command-line option, exit code, and output mode. |
 | [Python API](library.md) | Using `DongleClient` and the lower-level building blocks. |
 | [Protocol](protocol/index.md) | The wire format, handshake, and secure envelope. |
-| [Register Map](protocol/registers.md) | All 183 values with types, scales, and known quirks. |
+| [Register Map](protocol/registers.md) | All 235 values with types, scales, and known quirks. |
 | [Caveats & Troubleshooting](caveats.md) | Firmware differences, connection limits, and common failures. |
 | [Development](development.md) | Project layout, architecture, and running the test suite. |
 

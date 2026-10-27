@@ -134,6 +134,12 @@ keyed by register key.
 Registers whose backing words were not returned get
 `{"address", "name", "section", "error": "unavailable"}` instead of a `value`.
 
+A range refused by the dongle's table (the bare `64 07 01` stub) is read once
+per connection and then **parked**: later polls re-report it under
+`_unreadable_ranges` with the original error without putting it on the wire
+again, and `connect()` clears the park so a new connection probes it once
+more. Inverter-side `ModbusError` is never parked — it is retried every poll.
+
 ```python
 for key, reading in dongle.poll().items():
     if "value" in reading:

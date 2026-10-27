@@ -5,6 +5,49 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-26
+
+The register map is updated against *FuturaPulse hybrid inverter Modbus
+protocol v0.0.7* (the previous transcription was v0.0.3).
+
+### Added
+
+- **`battery2_parameters` section (`32240`–`32293`, 33 values)** — the second
+  battery's status, SOC/SOH, cell extremes, errors and charge limits, a
+  verbatim mirror of `battery_parameters` at +200 (protocol change D005). Only
+  valid on inverters with two BMS interfaces; on single-battery units the
+  range is refused or returns zeros.
+- **`meter2_parameters` section (`33101`–`33143`, 17 values)** — the optional
+  second meter, a verbatim mirror of `meter_parameters` at +100 (change D009).
+- **Meter self-test registers `33048` (`meter_testing_process`, 0~100 %) and
+  `33049` (`meter_testing_result`, 14 enum labels including the `0xAA55`
+  "testing" sentinel)** in `meter_parameters` (change D007).
+- **`poll()` parks dongle-table refusals.** A range answered with the dongle's
+  bare `64 07 01` stub (the battery2 block on a single-BMS dongle, for
+  instance) is probed once per connection and then skipped on the wire, while
+  still being reported under `_unreadable_ranges` with the original error and
+  its registers still reading `unavailable` — so the output shape is stable
+  and five doomed round trips per cycle drop to one probe per connection.
+  `connect()` clears the park; inverter-side `ModbusError` is never parked,
+  because it can be transient.
+
+The map now holds **235 values** across **42 coalesced read ranges** (was 183
+across 34), in fourteen sections.
+
+### Changed
+
+- **`30103` `mppt_input_type`** — v0.0.7 (change D006) reduced the enum from
+  five values to two: `0` independent input, `1` same panels parallel. The old
+  five-value list is kept in the register's `notes` for reference.
+- The `battery_parameters` and `meter_parameters` *sections* were narrowed to
+  `32040`–`32239` and `33000`–`33099` to make room for the new `battery2` and
+  `meter2` sections. `--section` filters that used the old names still work.
+
+### Fixed
+
+- `32265` `battery2_soh` uses the address the sequence implies; the document
+  prints `322065`, an obvious typo.
+
 ## [0.2.1] - 2026-10-19
 
 The project is renamed from `sitsolar-dongle-reader` to `sitsolar-dongle`.

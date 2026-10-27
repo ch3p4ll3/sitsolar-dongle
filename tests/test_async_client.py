@@ -40,6 +40,16 @@ def first_block_start() -> int:
     return next(iter(blocks()))[0]
 
 
+def fc4_ranges(payloads: list[bytes]) -> list[tuple[int, int]]:
+    """(first, last) address of every FC 0x04 read in *payloads*."""
+    out: list[tuple[int, int]] = []
+    for payload in payloads:
+        if payload[:6] == HEADER and payload[7] == 0x04:
+            address, count = struct.unpack(">HH", payload[8:12])
+            out.append((address, address + count - 1))
+    return out
+
+
 async def wait_until(predicate, timeout: float = 2.0) -> None:
     """Let the fake dongle's task catch up before asserting on it."""
     loop = asyncio.get_running_loop()
@@ -326,7 +336,7 @@ def test_poll_decodes_the_whole_map() -> None:
                 assert values["grid_frequency"]["value"] == 50.02
                 assert values["grid_frequency"]["unit"] == "Hz"
                 assert "_unreadable_ranges" not in values
-                assert len(values) == 183
+                assert len(values) == 235
 
     asyncio.run(main())
 
@@ -347,15 +357,70 @@ def test_poll_records_refused_ranges() -> None:
     asyncio.run(main())
 
 
+def test_poll_parks_stub_refusals_until_reconnect() -> None:
+    """A ``64 07 01`` stub costs one probe per connection, not one per poll.
+
+    The dongle answers that way for addresses outside its own forwarding
+    table (battery2 on a single-BMS unit), so the range is read once, keeps
+    being reported under ``_unreadable_ranges`` without being asked for
+    again -- and is probed once more after a reconnect, when the dongle
+    behind the connection may carry a different table.
+    """
+    battery2 = {32240, 32251, 32255, 32263, 32269}
+
+    async def main() -> None:
+        async with FakeDongle(refuse=set(battery2)) as dongle:
+            async with AsyncDongleClient(dongle.host, SERIAL,
+                                         port=dongle.port) as client:
+                first = await client.poll()
+                failures = first["_unreadable_ranges"]
+                assert [f["range"] for f in failures] == [
+                    "32240~32240", "32251~32251", "32255~32258",
+                    "32263~32265", "32269~32293"]
+                assert all("stub" in f["error"] for f in failures)
+                assert first["battery2_soc"]["error"] == "unavailable"
+                assert any(lo <= 32240 <= hi
+                           for lo, hi in fc4_ranges(dongle.requests))
+
+                sent = len(dongle.requests)
+                second = await client.poll()
+                # the report survives unchanged, down to the error text...
+                assert second["_unreadable_ranges"] == failures
+                assert second["battery2_soc"] == first["battery2_soc"]
+                # ...while nothing touches 32240~32293 on the wire again
+                retried = fc4_ranges(dongle.requests[sent:])
+                assert not any(lo <= 32293 and 32240 <= hi
+                               for lo, hi in retried)
+                from sitsolar_dongle.registers import blocks
+                assert len(retried) == len(blocks()) - len(battery2)
+
+                # a reconnect clears the park: the new table is probed
+                await client.connect()
+                sent = len(dongle.requests)
+                await client.poll()
+                retried = fc4_ranges(dongle.requests[sent:])
+                assert any(lo <= 32240 <= hi for lo, hi in retried)
+
+    asyncio.run(main())
+
+
 def test_poll_on_error_raise_propagates() -> None:
     async def main() -> None:
         from sitsolar_dongle.framing import DongleNoDataError
 
-        async with FakeDongle(refuse={first_block_start()}) as dongle:
+        first = first_block_start()
+        async with FakeDongle(refuse={first}) as dongle:
             async with AsyncDongleClient(dongle.host, SERIAL,
                                          port=dongle.port) as client:
                 with pytest.raises(DongleNoDataError):
                     await client.poll(on_error="raise")
+                # raising parks nothing: the next poll still probes the
+                # range, so on_error="raise" keeps failing every time
+                sent = len(dongle.requests)
+                values = await client.poll()
+                assert values["_unreadable_ranges"]
+                assert any(lo <= first <= hi
+                           for lo, hi in fc4_ranges(dongle.requests[sent:]))
 
     asyncio.run(main())
 

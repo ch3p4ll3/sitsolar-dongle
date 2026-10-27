@@ -116,7 +116,10 @@ with DongleClient("192.168.1.50", "<DONGLE_SERIAL>") as dongle:
 `poll()` reads every documented read-only register and returns a dict of
 decoded values. Ranges the firmware does not implement are recorded under
 `_unreadable_ranges` instead of raising — pass `on_error="raise"` to make them
-fatal.
+fatal. A range the *dongle's* table refuses (the bare `64 07 01` stub) is
+probed once per connection and then skipped on the wire while still being
+reported, so a single-BMS dongle doesn't re-read the missing battery2 block on
+every cycle.
 
 ## Protocol
 
@@ -171,7 +174,7 @@ push's own transaction id, exactly like the app does.
 ## Register map
 
 Read-only **input registers** `30000`–`35017`, transcribed from
-*FuturaPulse hybrid inverter Modbus protocol v0.0.3*:
+*FuturaPulse hybrid inverter Modbus protocol v0.0.7*:
 
 | Section | Range |
 |---|---|
@@ -184,7 +187,9 @@ Read-only **input registers** `30000`–`35017`, transcribed from
 | AC_side | 31000–31040 |
 | EPS_parameters | 32001–32026 |
 | battery_parameters | 32040–32093 |
-| meter_parameters | 33001–33043 |
+| battery2_parameters | 32240–32293 |
+| meter_parameters | 33001–33049 |
+| meter2_parameters | 33101–33143 |
 | generation_info | 34001–34043 |
 | Italy_self-test | 35001–35017 |
 
@@ -213,7 +218,9 @@ project never writes.
 * **Firmwares differ.** Single-phase units have no S/T phase, and optional
   blocks (EPS, meter, Italy self-test) may refuse a read — either with Modbus
   exception `0x02` from the inverter or with the dongle's bare `64 07 01`
-  stub. Both are recorded under `_unreadable_ranges` by default.
+  stub. Both are recorded under `_unreadable_ranges` by default; the stub
+  kind is additionally parked after its first appearance, so it is reported
+  but not re-read until the next `connect()`.
 * **`31016~31017` T-phase power** is documented as `S16` in the table but the
   address spans two registers and the R/S phases are `S32`; it is treated as
   `S32` here.

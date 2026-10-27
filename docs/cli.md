@@ -74,6 +74,11 @@ is never asked for a narrower range.
 `_unreadable_ranges` and carries on, because firmwares differ in which optional
 blocks they implement. `--errors raise` makes any refusal fatal.
 
+Ranges refused by the dongle's own table (the bare `64 07 01` stub) are read
+only once per connection: later polls repeat the entry in
+`_unreadable_ranges` but send no request for it. Restarting the command
+probes them again.
+
 `--raw` adds the un-scaled integer, plus a signed interpretation in
 parentheses when it differs — for example `raw=65535 (-1)` for a two's
 complement `-1`.
